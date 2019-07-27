@@ -2,7 +2,7 @@
   DeriveAnyClass, AllowAmbiguousTypes, TypeApplications, RecordWildCards, 
   MultiParamTypeClasses, FlexibleContexts, ExistentialQuantification, 
   DeriveGeneric, RankNTypes, LambdaCase #-}
-module Sorcerer (sorcerer_,sorcerer,read,write,events,Listener,listener,Source(..),Aggregable(..)) where
+module Sorcerer (sorcerer_,sorcerer,read,unsafeRead,write,events,Listener,listener,Source(..),Aggregable(..)) where
 
 import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write)
 
@@ -244,7 +244,8 @@ aggregator fp AggregatorEnv {..} = do
           let 
             !mag = List.foldl' (flip (update @ev @ag)) initial (List.drop from vs)
             cur = Aggregate aeLatest mag
-          A.encodeFile fp cur 
+          A.encodeFile (fp <> ".temp") cur 
+          renameFile (fp <> ".temp") fp
           pure cur
 
     run :: Aggregate ag -> AggregatorMsg -> IO (Aggregate ag)
@@ -257,13 +258,15 @@ aggregator fp AggregatorEnv {..} = do
                 Just e -> let ag = (update @ev @ag) e aAggregate in pure (Aggregate tid ag)
                 _      -> error "aggregator.runner: invariant broken; received impossible write event"
 
-            Read _ _ _ cb ->
+            Read _ _ _ cb -> do
+              print "Reading"
               case cast cb :: Maybe (Maybe ag -> IO ()) of
                 Just f -> f aAggregate >> pure cur
                 _      -> error "aggregator.runner: invariant broken; received impossible read event"
 
         Persist persisted -> do
-          A.encodeFile fp cur 
+          A.encodeFile (fp <> ".temp") cur 
+          renameFile (fp <> ".temp") fp
           persisted 
           pure cur
 
@@ -600,6 +603,15 @@ read s = do
   publish (SorcererEvent (Read ev s ag (putMVar mv)))
   takeMVar mv
 
+{-# INLINE unsafeRead #-}
+unsafeRead :: forall ev ag. (FromJSON (Aggregate ag), Aggregable ev ag) => Stream ev -> IO (Maybe ag)
+unsafeRead s = do
+  let fp = dropExtension (stream s) </> aggregate @ev @ag
+  esemag <- try (A.decodeFileStrict fp)
+  case esemag of
+    Left (_ :: SomeException) -> pure Nothing
+    Right mag -> pure (join $ fmap aAggregate mag)
+
 {-# INLINE write #-}
 write :: forall ev. (Hashable (Stream ev), Source ev) => Stream ev -> ev -> IO ()
 write s ev = 
@@ -607,6 +619,7 @@ write s ev =
               Fingerprint x _ -> fromIntegral x
   in publish (SorcererEvent (Write ety s ev))
 
+{-# INLINE events #-}
 events :: forall ev. (Hashable (Stream ev),Source ev) => Stream ev -> IO [ev]
 events s = do
   let !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of
