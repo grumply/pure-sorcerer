@@ -2,7 +2,7 @@
   DeriveAnyClass, AllowAmbiguousTypes, TypeApplications, RecordWildCards, 
   MultiParamTypeClasses, FlexibleContexts, ExistentialQuantification, 
   DeriveGeneric, RankNTypes, LambdaCase #-}
-module Sorcerer (sorcerer_,sorcerer,read,unsafeRead,write,events,Listener,listener,Source(..),Aggregable(..)) where
+module Sorcerer (sorcerer_,sorcerer,read,unsafeRead,write,transact,events,Listener,listener,Source(..),Aggregable(..)) where
 
 import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write)
 
@@ -181,6 +181,13 @@ data Event
     , _ag      :: {-# UNPACK #-}!Int
     , callback :: Maybe ag -> IO ()
     }
+  | forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Update
+    { _ty      :: {-# UNPACK #-}!Int
+    , _ident   :: Stream ev
+    , _ag      :: {-# UNPACK #-}!Int
+    , event    :: ev
+    , callback :: Maybe ag -> IO ()
+    }
   | forall ev ag. (Hashable (Stream ev), Source ev) => Log
     { _ty     :: {-# UNPACK #-}!Int
     , _ident  :: Stream ev
@@ -263,6 +270,14 @@ aggregator fp AggregatorEnv {..} = do
               case cast cb :: Maybe (Maybe ag -> IO ()) of
                 Just f -> f aAggregate >> pure cur
                 _      -> error "aggregator.runner: invariant broken; received impossible read event"
+
+            Update _ _ _ ev cb ->
+              case cast ev of
+                Just e -> let ag = (update @ev @ag) e aAggregate 
+                           in case cast cb :: Maybe (Maybe ag -> IO ()) of
+                                Just f  -> f ag >> pure (Aggregate tid ag)
+                                Nothing -> pure (Aggregate tid ag)
+                Nothing -> error "aggregator.runner: invariant broken; received impossible update event"
 
         Persist persisted -> do
           A.encodeFile (fp <> ".temp") cur 
@@ -520,6 +535,14 @@ manager tx ls done s mgr@(q_,st_) = do
                       writeChan ch (AggregatorEvent tid ev)
                       pure (tid,i)
 
+                    Stream ev@(Update _ _ _ e _) -> do
+                      let newTid = tid + 1
+                      case cast e :: Maybe ev of
+                        Just ev -> record mh newTid ev
+                        Nothing -> error "manager: Invariant broken; invalid message type"
+                      writeChan ch (AggregatorEvent tid ev)
+                      pure (newTid,i)
+
                     Stream (Log e _ f) -> do
                       case cast f :: Maybe ([ev] -> IO ()) of
                         Just g -> do
@@ -564,10 +587,18 @@ manager tx ls done s mgr@(q_,st_) = do
                       writeChan ch (AggregatorEvent newTid ev)
                       pure (False,newTid,i)
             
-                    Stream ev@(Read e _ a _) -> do
+                    Stream ev@(Read _ _ _ _) -> do
                       writeChan ch (AggregatorEvent tid ev)
                       -- I think it's safe to keep closing with a read event in flight
                       pure (isClosing,tid,i)
+
+                    Stream ev@(Update _ _ _ e _) -> do
+                      let newTid = tid + 1
+                      case cast e :: Maybe ev of
+                        Just ev -> record mh newTid ev
+                        Nothing -> error "manager: Invariant broken; invalid message type"
+                      writeChan ch (AggregatorEvent tid ev)
+                      pure (False,newTid,i)
 
                     Stream (Log e _ f) -> do
                       case cast f :: Maybe ([ev] -> IO ()) of
@@ -591,18 +622,20 @@ data SorcererMsg
   | Done Int Int
   | SorcererEvent Event
 
+-- Get the current value of an aggregate.
 {-# INLINE read #-}
 read :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> IO (Maybe ag)
 read s = do
   let 
-    !ev = case typeRepFingerprint (typeOf (undefined :: ev)) of
-          Fingerprint x _ -> fromIntegral x
-    !ag = case typeRepFingerprint (typeOf (undefined :: ag)) of
-          Fingerprint x _ -> fromIntegral x
+    !ev = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
+    !ag = case typeRepFingerprint (typeOf (undefined :: ag)) of Fingerprint x _ -> fromIntegral x
   mv <- newEmptyMVar
   publish (SorcererEvent (Read ev s ag (putMVar mv)))
   takeMVar mv
 
+-- A version of read that ignores any unwritten updates and directly reads the aggregate from disk.
+-- Useful to check for the existence of an aggregate without creating an empty stream and without the
+-- possible overhead of stream-associated aggregates.
 {-# INLINE unsafeRead #-}
 unsafeRead :: forall ev ag. (FromJSON (Aggregate ag), Aggregable ev ag) => Stream ev -> IO (Maybe ag)
 unsafeRead s = do
@@ -612,12 +645,23 @@ unsafeRead s = do
     Left (_ :: SomeException) -> pure Nothing
     Right mag -> pure (join $ fmap aAggregate mag)
 
+-- Write an event to an event stream.
 {-# INLINE write #-}
 write :: forall ev. (Hashable (Stream ev), Source ev) => Stream ev -> ev -> IO ()
 write s ev = 
-  let !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of
-              Fingerprint x _ -> fromIntegral x
+  let !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
   in publish (SorcererEvent (Write ety s ev))
+
+-- Transactional version of write s ev >> read s.
+{-# INLINE transact #-}
+transact :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> ev -> IO (Maybe ag)
+transact s ev = do
+  let
+    !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
+    !aty = case typeRepFingerprint (typeOf (undefined :: ag)) of Fingerprint x _ -> fromIntegral x
+  mv <- newEmptyMVar
+  publish (SorcererEvent (Update ety s aty ev (putMVar mv)))
+  takeMVar mv
 
 {-# INLINE events #-}
 events :: forall ev. (Hashable (Stream ev),Source ev) => Stream ev -> IO [ev]
@@ -715,9 +759,10 @@ sorcerer_ tx ls = run app env
                       dispatch mgr (Stream ev)
                       pure mdl
           case ev of
-            Read _ty s  _ _ -> go _ty s
-            Write _ty s _   -> go _ty s
-            Log _ty s _     -> go _ty s
+            Read _ty s  _ _    -> go _ty s
+            Write _ty s _      -> go _ty s
+            Log _ty s _        -> go _ty s
+            Update _ty s _ _ _ -> go _ty s
 
     view _ _ = Pure.Elm.Null
 
