@@ -2,7 +2,7 @@
   DeriveAnyClass, AllowAmbiguousTypes, TypeApplications, RecordWildCards, 
   MultiParamTypeClasses, FlexibleContexts, ExistentialQuantification, 
   DeriveGeneric, RankNTypes, LambdaCase #-}
-module Sorcerer (sorcerer_,sorcerer,read,unsafeRead,write,transact,events,Listener,listener,Source(..),Aggregable(..)) where
+module Sorcerer (sorcerer_,sorcerer,read,unsafeRead,write,transact,observe,events,Listener,listener,Source(..),Aggregable(..)) where
 
 import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write)
 
@@ -182,11 +182,11 @@ data Event
     , callback :: Maybe ag -> IO ()
     }
   | forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Update
-    { _ty      :: {-# UNPACK #-}!Int
-    , _ident   :: Stream ev
-    , _ag      :: {-# UNPACK #-}!Int
-    , event    :: ev
-    , callback :: Maybe ag -> IO ()
+    { _ty     :: {-# UNPACK #-}!Int
+    , _ident  :: Stream ev
+    , _ag     :: {-# UNPACK #-}!Int
+    , event   :: ev
+    , inspect :: Maybe ag -> Maybe ag -> IO ()
     }
   | forall ev ag. (Hashable (Stream ev), Source ev) => Log
     { _ty     :: {-# UNPACK #-}!Int
@@ -274,8 +274,8 @@ aggregator fp AggregatorEnv {..} = do
             Update _ _ _ ev cb ->
               case cast ev of
                 Just e -> let ag = (update @ev @ag) e aAggregate 
-                           in case cast cb :: Maybe (Maybe ag -> IO ()) of
-                                Just f  -> f ag >> pure (Aggregate tid ag)
+                           in case cast cb :: Maybe (Maybe ag -> Maybe ag -> IO ()) of
+                                Just f  -> f aAggregate ag >> pure (Aggregate tid ag)
                                 Nothing -> pure (Aggregate tid ag)
                 Nothing -> error "aggregator.runner: invariant broken; received impossible update event"
 
@@ -660,7 +660,17 @@ transact s ev = do
     !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
     !aty = case typeRepFingerprint (typeOf (undefined :: ag)) of Fingerprint x _ -> fromIntegral x
   mv <- newEmptyMVar
-  publish (SorcererEvent (Update ety s aty ev (putMVar mv)))
+  publish (SorcererEvent (Update ety s aty ev (\_ -> putMVar mv)))
+  takeMVar mv
+
+{-# INLINE observe #-}
+observe :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> ev -> IO (Maybe ag,Maybe ag)
+observe s ev = do
+  let
+    !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
+    !aty = case typeRepFingerprint (typeOf (undefined :: ag)) of Fingerprint x _ -> fromIntegral x
+  mv <- newEmptyMVar
+  publish (SorcererEvent (Update ety s aty ev (\before after -> putMVar mv (before,after))))
   takeMVar mv
 
 {-# INLINE events #-}
