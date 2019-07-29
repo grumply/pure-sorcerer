@@ -1,7 +1,7 @@
 {-# LANGUAGE ScopedTypeVariables, BangPatterns, DefaultSignatures, TypeFamilies,
   DeriveAnyClass, AllowAmbiguousTypes, TypeApplications, RecordWildCards, 
   MultiParamTypeClasses, FlexibleContexts, ExistentialQuantification, 
-  DeriveGeneric, RankNTypes, LambdaCase #-}
+  DeriveGeneric, RankNTypes, LambdaCase, OverloadedStrings #-}
 module Sorcerer (sorcerer,read,read',write,transact,observe,events,Listener,listener,Source(..),Aggregable(..)) where
 
 import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write)
