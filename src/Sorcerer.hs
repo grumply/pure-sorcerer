@@ -186,6 +186,39 @@ data AggregatorMsg
   | Persist (IO ())
   | Shutdown
 
+{-# INLINE writeAggregate #-}
+writeAggregate :: ToJSON ag => FilePath -> Aggregate ag -> IO ()
+writeAggregate fp (Aggregate tid mag) = do
+  withFile fp WriteMode $ \h -> do
+    let 
+      stid = show tid
+      commit = stid ++ (replicate (11 - List.length stid) ' ')
+    hPutStrLn h commit
+    BSLC.hPut h (A.encode mag)
+
+{-# INLINE readAggregate #-}
+readAggregate :: FromJSON ag => FilePath -> IO (Aggregate ag)
+readAggregate fp = do
+  withFile fp ReadMode $ \h -> do
+    ln <- System.IO.hGetLine h
+    case readMaybe ln of
+      Nothing -> error "Could not read aggregate." 
+      Just transaction -> do
+        mmag <- A.decode <$> BSLC.hGetContents h
+        case mmag of
+          Nothing -> error "Could not read aggregate."
+          Just mag -> pure $ Aggregate transaction mag
+
+{-# INLINE commitAggregate #-}
+commitAggregate :: FilePath -> TransactionId -> IO ()
+commitAggregate fp tid = do
+  fd <- P.openFd fp P.WriteOnly (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
+  let 
+    stid = show tid
+    commit = stid ++ (replicate (11 - List.length stid) ' ') ++ "\n"
+  P.fdWrite fd commit
+  P.closeFd fd
+
 {-# INLINE aggregator #-}
 aggregator :: forall ev ag. (ToJSON ag, FromJSON (Aggregate ag), ToJSON (Aggregate ag), Aggregable ev ag) 
            => FilePath -> AggregatorEnv -> IO ()
@@ -219,7 +252,7 @@ aggregator fp AggregatorEnv {..} = do
             diff = aeLatest - from
             !mag = List.foldl' (\ag ev -> join $ update @ev @ag ev ag) initial (List.take diff $ List.drop from vs)
             !cur = Aggregate aeLatest mag
-          A.encodeFile (fp <> ".temp") cur 
+          writeAggregate (fp <> ".temp") cur
           renameFile (fp <> ".temp") fp
           pure cur
 
@@ -231,7 +264,7 @@ aggregator fp AggregatorEnv {..} = do
             Write _ _ ev ->
               case cast ev of
                 Just e -> let !mmag = (update @ev @ag) e aAggregate 
-                              changed' = maybe False (const True) mmag
+                              changed' = maybe (maybe False (const True) aAggregate) (const True) mmag
                               mag = join mmag
                            in pure (changed || changed',Aggregate tid mag)
                 _      -> error "aggregator.runner: invariant broken; received impossible write event"
@@ -244,7 +277,7 @@ aggregator fp AggregatorEnv {..} = do
             Update _ _ _ ev cb ->
               case cast ev of
                 Just e -> let !mmag = (update @ev @ag) e aAggregate 
-                              changed' = maybe False (const True) mmag
+                              changed' = maybe (maybe False (const True) aAggregate) (const True) mmag
                               mag = join mmag
                            in case cast cb :: Maybe (Maybe ag -> Maybe ag -> IO ()) of
                                 Just f  -> f aAggregate mag >> pure (changed || changed',Aggregate tid mag)
@@ -252,9 +285,16 @@ aggregator fp AggregatorEnv {..} = do
                 Nothing -> error "aggregator.runner: invariant broken; received impossible update event"
 
         Persist persisted -> do
-          when changed $ do
-            A.encodeFile (fp <> ".temp") cur 
+          if changed then do
+            writeAggregate (fp <> ".temp") cur
             renameFile (fp <> ".temp") fp
+          else do
+            exists <- doesFileExist fp
+            if not exists then do
+              writeAggregate (fp <> ".temp") cur
+              renameFile (fp <> ".temp") fp
+            else
+              commitAggregate fp aCurrent
           persisted 
           pure (changed,cur)
 
