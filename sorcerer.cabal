@@ -22,6 +22,7 @@ library
     , hashable
     , containers
     , aeson
+    , unix
 
 
   exposed-modules:

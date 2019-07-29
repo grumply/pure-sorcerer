@@ -2,7 +2,7 @@
   DeriveAnyClass, AllowAmbiguousTypes, TypeApplications, RecordWildCards, 
   MultiParamTypeClasses, FlexibleContexts, ExistentialQuantification, 
   DeriveGeneric, RankNTypes, LambdaCase #-}
-module Sorcerer (sorcerer_,sorcerer,read,unsafeRead,write,transact,observe,events,Listener,listener,Source(..),Aggregable(..)) where
+module Sorcerer (sorcerer,read,read',write,transact,observe,events,Listener,listener,Source(..),Aggregable(..)) where
 
 import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write)
 
@@ -12,6 +12,8 @@ import qualified Data.ByteString.Internal as BS
 import qualified Data.ByteString.Lazy.Internal as BSL
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy.Char8 as BSLC
+import qualified Data.ByteString.Unsafe as BSU
+import qualified Data.ByteString.Builder as BSB
 
 import Control.Concurrent
 import Control.Exception
@@ -36,6 +38,13 @@ import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 
 import Prelude hiding (read)
+
+import qualified System.Posix.Files       as P
+import qualified System.Posix.IO          as P
+import           System.Posix.Types       as P (Fd, FileOffset)
+import Foreign.Marshal
+import Foreign.ForeignPtr
+import Foreign.Ptr
 
 --------------------------------------------------------------------------------
 -- Modified version of Neil Mitchell's `The Flavor of MVar` Queue from:
@@ -83,66 +92,14 @@ collect q_ =
     Left xs -> return (Left [], return $ List.reverse xs)
 
 --------------------------------------------------------------------------------
--- A Handle for use in asynchronous cases with multiple readers/writers.
--- Specifically for supporting a lazy seeking reader a la `unsafeInterleaveIO`,
--- and an atomic logger with a multi-phase seeking write.
 
--- Stream a lazy ByteString on-demand from a shared Handle ignoring `beginning` bytes.
-{-# INLINE sGetContentsFrom #-}
-sGetContentsFrom :: Int -> MVar Handle -> IO BSL.ByteString
-sGetContentsFrom beginning mh = start
+getEvents :: forall ev. Source ev => FilePath -> IO [ev]
+getEvents fp = do
+  cnts <- BSLC.readFile fp
+  pure $ fmap snd $ catMaybes $ fmap decode_ $ List.drop 1 $ BSLC.lines cnts
   where
-    decode_ ln =
-      case A.decode ln of
-        Nothing -> Nothing
-        Just a -> Just a
-
-    start = do
-      h <- takeMVar mh
-      end <- hTell h
-      putMVar mh h
-      go (fromIntegral end) beginning
-      where
-        go end = lazyRead 
-          where
-
-            lazyRead off = unsafeInterleaveIO (loop off)
-
-            loop off = do
-              h <- takeMVar mh 
-              reset <- hTell h
-              hSeek h AbsoluteSeek (fromIntegral off)
-              let
-                eo = end - off
-                mk = if eo < BSL.defaultChunkSize then Just eo else Nothing
-              c <- BS.hGetSome h (fromMaybe BSL.defaultChunkSize mk)
-              hSeek h AbsoluteSeek reset
-              c `seq` putMVar mh h
-              case mk of
-                Nothing -> do
-                  cs <- lazyRead (off + BSL.defaultChunkSize) 
-                  return (BSL.Chunk c cs)
-                Just _  ->
-                  return (BSL.Chunk c mempty)
-
---------------------------------------------------------------------------------
--- Custom streaming methods that avoid the first 13 bytes of a file
--- and lazily stream each line as a JSON value, encoded or decoded.
-
-{-# INLINE events' #-}
-events' :: FromJSON ev => MVar Handle -> IO [ev]
-events' s = fmap (expectSuccess . A.fromJSON . snd) <$> transactions' s
-  where
-    expectSuccess (A.Success a) = a
-    expectSuccess (Error s) = error $ "events': Invariant broken; invalid event: " ++ s
-
-{-# INLINE transactions' #-}
-transactions' :: MVar Handle -> IO [(A.Value,A.Value)]
-transactions' s = fmap fromJust <$> transactions s
-
-{-# INLINE transactions #-}
-transactions :: MVar Handle -> IO [Maybe (A.Value,A.Value)]
-transactions s = (fmap A.decode . BSLC.lines) <$> sGetContentsFrom 13 s
+    decode_ :: BSL.ByteString -> Maybe (Int,ev)
+    decode_ = decode
 
 --------------------------------------------------------------------------------
 -- Core Source/Aggregable types for defining event sourcing resources.
@@ -188,11 +145,6 @@ data Event
     , event   :: ev
     , inspect :: Maybe ag -> Maybe ag -> IO ()
     }
-  | forall ev ag. (Hashable (Stream ev), Source ev) => Log
-    { _ty     :: {-# UNPACK #-}!Int
-    , _ident  :: Stream ev
-    , withLog :: [ev] -> IO () -- the list will be strict
-    }
 
 --------------------------------------------------------------------------------
 -- Transaction tag; monotonically increasing
@@ -209,7 +161,7 @@ data Aggregate ag = Aggregate
   } deriving (Generic,ToJSON,FromJSON)
 
 data AggregatorEnv = AggregatorEnv
-  { aeEvents   :: MVar Handle
+  { aeEvents   :: FilePath
   , aeMessages :: Chan AggregatorMsg
   , aeLatest   :: TransactionId
   }
@@ -224,7 +176,7 @@ aggregator :: forall ev ag. (ToJSON ag, FromJSON (Aggregate ag), ToJSON (Aggrega
            => FilePath -> AggregatorEnv -> IO ()
 aggregator fp AggregatorEnv {..} = do
   createDirectoryIfMissing True (takeDirectory fp)
-  void $ forkIO $ do
+  Control.Monad.void $ forkIO $ do
     ag <- prepare 
     ms <- getChanContents aeMessages
     foldM_ run ag ms
@@ -247,10 +199,11 @@ aggregator fp AggregatorEnv {..} = do
 
         fold :: Int -> Maybe ag -> IO (Aggregate ag)
         fold from initial = do
-          vs <- events' aeEvents
+          vs <- getEvents aeEvents
           let 
-            !mag = List.foldl' (flip (update @ev @ag)) initial (List.drop from vs)
-            cur = Aggregate aeLatest mag
+            diff = aeLatest - from
+            !mag = List.foldl' (flip (update @ev @ag)) initial (List.take diff $ List.drop from vs)
+            !cur = Aggregate aeLatest mag
           A.encodeFile (fp <> ".temp") cur 
           renameFile (fp <> ".temp") fp
           pure cur
@@ -262,21 +215,20 @@ aggregator fp AggregatorEnv {..} = do
           case e of
             Write _ _ ev ->
               case cast ev of
-                Just e -> let ag = (update @ev @ag) e aAggregate in pure (Aggregate tid ag)
+                Just e -> let !mag = (update @ev @ag) e aAggregate in pure (Aggregate tid mag)
                 _      -> error "aggregator.runner: invariant broken; received impossible write event"
 
-            Read _ _ _ cb -> do
-              print "Reading"
+            Read _ _ _ cb ->
               case cast cb :: Maybe (Maybe ag -> IO ()) of
                 Just f -> f aAggregate >> pure cur
                 _      -> error "aggregator.runner: invariant broken; received impossible read event"
 
             Update _ _ _ ev cb ->
               case cast ev of
-                Just e -> let ag = (update @ev @ag) e aAggregate 
+                Just e -> let !mag = (update @ev @ag) e aAggregate 
                            in case cast cb :: Maybe (Maybe ag -> Maybe ag -> IO ()) of
-                                Just f  -> f aAggregate ag >> pure (Aggregate tid ag)
-                                Nothing -> pure (Aggregate tid ag)
+                                Just f  -> f aAggregate mag >> pure (Aggregate tid mag)
+                                Nothing -> pure (Aggregate tid mag)
                 Nothing -> error "aggregator.runner: invariant broken; received impossible update event"
 
         Persist persisted -> do
@@ -312,99 +264,98 @@ listener =
     Listener (ev,ag) (aggregate @ev @ag) (aggregator @ev @ag)
 
 {-# INLINE startAggregators #-}
-startAggregators :: Source ev => Stream ev -> MVar Handle -> TransactionId -> [Listener] -> IO (Chan AggregatorMsg)
-startAggregators s mh tid ls = do
+startAggregators :: Source ev => Stream ev -> FilePath -> TransactionId -> [Listener] -> IO (Chan AggregatorMsg)
+startAggregators s stream_fp tid ls = do
   chan <- newChan
   for_ ls $ \(Listener i fp ag) -> do
     ch <- dupChan chan
-    ag (dropExtension (stream s) </> fp) (AggregatorEnv mh ch tid)
+    ag (dropExtension (stream s) </> fp) (AggregatorEnv stream_fp ch tid)
   pure chan
 
 --------------------------------------------------------------------------------
 -- Log resumption; should be able to safely recover a majority of failures
 
 {-# INLINE resumeLog #-}
-resumeLog :: forall ev. Source ev => MVar Handle -> FilePath -> IO TransactionId
-resumeLog mh fp = do
-  h <- takeMVar mh
-  hSeek h AbsoluteSeek 0
-  eof <- hIsEOF h
-  i <- if eof then newStream h else recover h
-  putMVar mh h
-  pure i
+resumeLog :: forall ev. Source ev => P.Fd -> FilePath -> IO TransactionId
+resumeLog fd fp = do
+  off <- P.fdSeek fd SeekFromEnd 0
+  let eof = off == 0
+  if eof then 
+    newStream 
+  else 
+    recover
   where
-    newStream :: Handle -> IO TransactionId
-    newStream h = do
-      hPutStrLn h "00          "
+    newStream :: IO TransactionId
+    newStream = do
+      P.fdWrite fd "00          "
       pure 0
 
-    recover :: Handle -> IO TransactionId
-    recover h = do
-      ln <- hGetLine h
+    recover :: IO TransactionId
+    recover = do
+      _ <- P.fdSeek fd AbsoluteSeek 0
+      (ln,_) <- P.fdRead fd 12
       i <- 
         case ln of
           '1':tid ->
             case readMaybe tid of
-              Nothing -> repair h
+              Nothing -> repair
               Just i  -> pure i
-          '0':tid -> repair h
+          '0':tid -> repair
           _ -> error $ "manager: unrecoverable steram file " ++ fp
 
-      hSeek h AbsoluteSeek 0
-      hPutChar h '0'
-      hSeek h SeekFromEnd 0
+      P.fdSeek fd AbsoluteSeek 0
+      P.fdWrite fd "0"
+      P.fdSeek fd SeekFromEnd 0
 
       pure i
 
-    repair :: Handle -> IO TransactionId
-    repair h = do
+    repair :: IO TransactionId
+    repair = do
       sane <- hasTrailingNewline
-      hSeek h SeekFromEnd 0
+      end <- P.fdSeek fd SeekFromEnd 0
       i <-
         if sane then do
           findNthFromLastNewline 1
-          ln <- BSC.hGetLine h
-          case A.decodeStrict ln :: Maybe (Int,A.Value) of
+          ln <- fdGetLn
+          case A.decode (BSLC.pack ln) :: Maybe (Int,A.Value) of
             Just (i,_) -> do
               commit i
               pure i
             Nothing -> 
               error $ "resumeLog.repair: unrecoverable event stream: " ++ fp
         else do
-          end <- hTell h
-          findNthFromLastNewline 0
-          off <- hTell h
-          let count = fromIntegral (end - off)
-          BSC.hPutStr h (BSC.replicate count ' ')
-          findNthFromLastNewline 1
-          ln <- BSC.hGetLine h
-          case A.decodeStrict ln :: Maybe (Int,A.Value) of
+          off <- findNthFromLastNewline 0
+          let count = fromIntegral end - off
+          P.fdWrite fd (List.replicate count ' ')
+          _ <- findNthFromLastNewline 1
+          ln <- fdGetLn
+          case A.decode (BSLC.pack ln) :: Maybe (Int,A.Value) of
             Just (i,_) -> do
               commit i
               pure i
             Nothing ->
               error $ "resumeLog.repair: unrecoverable event stream: " ++ fp
          
-      hSeek h SeekFromEnd 0
+      P.fdSeek fd SeekFromEnd 0
 
       pure i
 
       where
         hasTrailingNewline :: IO Bool
         hasTrailingNewline = do
-          hSeek h SeekFromEnd (-1)
-          c <- hGetChar h
-          pure (c == '\n')
+          P.fdSeek fd SeekFromEnd (-1)
+          (c,_) <- P.fdRead fd 1
+          pure (c == "\n")
 
-        findNthFromLastNewline :: Int -> IO ()
+        findNthFromLastNewline :: Int -> IO Int
         findNthFromLastNewline n = go 0 1
           where
             go i p = do
-              hSeek h SeekFromEnd (negate p)
-              c <- hGetChar h
-              if c == '\n' then
+              off <- P.fdSeek fd SeekFromEnd (fromIntegral $ negate p)
+              (c,_) <- P.fdRead fd 1
+              if c == "\n" then
                 if n == i then 
-                  pure ()
+                  pure (fromIntegral off + 1)
                 else
                   go (i + 1) (p + 1)
               else
@@ -412,28 +363,54 @@ resumeLog mh fp = do
 
         commit :: Int -> IO ()
         commit c = do
-          hSeek h AbsoluteSeek 0
-          hPutStrLn h (replicate 12 ' ')
-          hSeek h AbsoluteSeek 0
-          hPutStr h ('1':show c)
+          P.fdSeek fd AbsoluteSeek 0
+          P.fdWrite fd (replicate 11 ' ' ++ "\n")
+          P.fdSeek fd AbsoluteSeek 0
+          P.fdWrite fd ('1':show c)
+          pure ()
+
+        fdGetLn :: IO String
+        fdGetLn = lazyRead
+          where
+            lazyRead = unsafeInterleaveIO loop
+            loop = do
+              (s,_) <- P.fdRead fd 1
+              case s of
+                [] -> error "fdGetLn: failed to read full line"
+                ['\n'] -> pure []
+                ~[c] -> do
+                  cs <- lazyRead
+                  pure (c:cs)
 
 {-# INLINE record #-}
-record :: ToJSON ev => MVar Handle -> TransactionId -> ev -> IO ()
-record mh tid e = do
-  h <- takeMVar mh
-  BSLC.hPutStrLn h (A.encode (tid,e))
-  putMVar mh h
+record :: ToJSON ev => P.Fd -> TransactionId -> ev -> IO ()
+record fd tid e = do
+  let (fptr, off, len) = BS.toForeignPtr (BSLC.toStrict $ A.encode (tid,e))
+  withForeignPtr fptr $
+    \wptr -> do
+      P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
+      P.fdWrite fd "\n"
+      pure ()
+
+{-# INLINE records #-}
+records :: P.Fd -> BSB.Builder -> IO ()
+records fd bsb = do
+  let (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
+  !i <- withForeignPtr fptr $
+    \wptr -> P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
+  pure ()
 
 {-# INLINE commit #-}
-commit :: Handle -> TransactionId -> IO ()
-commit h tid = do
-  hSeek h AbsoluteSeek 0
+commit :: P.Fd -> TransactionId -> IO ()
+commit fd tid = do
+  P.fdSeek fd AbsoluteSeek 0
   let 
     commitString = 
       let str = show tid
-      in '1':str ++ (replicate (11 - List.length str) ' ')
-  hPutStrLn h commitString
-  hSeek h SeekFromEnd 0
+      in '1':str ++ (replicate (10 - List.length str) ' ')
+  P.fdWrite fd (commitString ++ "\n")
+  P.fdSeek fd SeekFromEnd 0
+  pure ()
 
 --------------------------------------------------------------------------------
 -- Manager; maintains aggregators and an event Stream; accepts and dispatches
@@ -442,7 +419,6 @@ commit h tid = do
 
 data ManagerMsg
   = Stream Event
-  | Events ([A.Value] -> IO ())
   | Persisted
 
 data ManagerState = ManagerState
@@ -481,8 +457,8 @@ dispatch (q_,st_) msg = do
 
 -- Extra harmless whitespace may be possible in the stream file after a recovery.
 -- consider lazily initializing aggregators for read-heavy workloads
-manager :: forall ev. Source ev => Bool -> [Listener] -> IO () -> Stream ev -> Manager -> IO ()
-manager tx ls done s mgr@(q_,st_) = do
+manager :: forall ev. Source ev => [Listener] -> IO () -> Stream ev -> Manager -> IO ()
+manager ls done s mgr@(q_,st_) = do
   createDirectoryIfMissing True (takeDirectory fp)
   initialize
   where
@@ -491,123 +467,102 @@ manager tx ls done s mgr@(q_,st_) = do
     count = List.length ls
 
     initialize = do
-      h <- openBinaryFile fp ReadWriteMode
-      hSetBuffering h (if tx then LineBuffering else BlockBuffering Nothing)
-      mh <- newMVar h
-      tid <- resumeLog @ev mh fp 
-      chan <- startAggregators s mh tid ls
-      start mh chan tid 
+      fd <- P.openFd fp P.ReadWrite (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
+      tid <- resumeLog @ev fd fp 
+      chan <- startAggregators s fp tid ls
+      start fd chan tid 
 
-    start mh ch = \tid -> void $ forkIO $ go tid 0 
+    start fd ch = \tid -> Control.Monad.void $ forkIO $ go tid 0
       where
         go :: TransactionId -> Int -> IO ()
         go = running
           where
-            running tid i = do
+            running :: TransactionId -> Int -> IO ()
+            running !tid !i = do
               ms <- collect q_
-              (newtid,i') <- foldM fold (tid,i) ms
+              (!evs',!c',!newtid,!i') <- foldM fold (mempty,0,tid,i) ms
               isClosing <- withEmptyQueue q_ $
                 writeChan ch (Persist (arrive q_ Persisted))
+              when (c' > 0) $ do
+                records fd evs'
+                commit fd newtid
               if isClosing then 
                 closing newtid (i' + count)
               else 
                 running newtid i'
               where
-                fold (tid,i) msg =
+                fold (evs,c,tid,i) msg =
                   case msg of
                     Persisted -> 
-                      pure (tid,i - 1)
-
-                    Events f -> do
-                      es <- events' mh
-                      f es
-                      pure (tid,i)
+                      pure (evs,c,tid,i - 1)
 
                     Stream ev@(Write _ _ e) -> do
                       let newTid = tid + 1
-                      case cast e :: Maybe ev of
-                        Just ev -> record mh newTid ev
+                      e <- case cast e :: Maybe ev of
+                        Just ev -> pure ev
                         Nothing -> error "manager: Invariant broken; invalid message type"
                       writeChan ch (AggregatorEvent newTid ev)
-                      pure (newTid,i)
+                      let bs = BSB.lazyByteString (A.encode (newTid,e)) <> "\n"
+                      pure (evs <> bs,c + 1,newTid,i)
                     
                     Stream ev@(Read e _ a _) -> do
                       writeChan ch (AggregatorEvent tid ev)
-                      pure (tid,i)
+                      pure (evs,c,tid,i)
 
                     Stream ev@(Update _ _ _ e _) -> do
                       let newTid = tid + 1
-                      case cast e :: Maybe ev of
-                        Just ev -> record mh newTid ev
+                      e <- case cast e :: Maybe ev of
+                        Just ev -> pure ev
                         Nothing -> error "manager: Invariant broken; invalid message type"
                       writeChan ch (AggregatorEvent tid ev)
-                      pure (newTid,i)
+                      let bs = BSB.lazyByteString (A.encode (newTid,e)) <> "\n"
+                      pure (evs <> bs,c + 1,newTid,i)
 
-                    Stream (Log e _ f) -> do
-                      case cast f :: Maybe ([ev] -> IO ()) of
-                        Just g -> do
-                          es <- events' mh
-                          let l = List.length es
-                          l `seq` f es
-                        Nothing -> pure ()
-                      pure (tid,i)
-
-            closing tid i = do
+            closing :: TransactionId -> Int -> IO ()
+            closing !tid !i = do
               ms <- collect q_
-              (isClosing,newtid,i') <- foldM fold (True,tid,i) ms
+              (!evs',!c',!isClosing,!newtid,!i') <- foldM fold (mempty,0,True,tid,i) ms
+              when (c' > 0) $ do
+                records fd evs'
+                commit fd newtid
               if isClosing && i' == 0 then do
                 let shutdown = do
-                      h <- takeMVar mh
-                      commit h newtid
                       writeChan ch Shutdown
-                      hClose h
-                closed <- suspend mgr shutdown (start mh ch newtid) done
-                unless closed $ 
-                  running newtid 0
+                      P.closeFd fd
+                closed <- suspend mgr shutdown (Control.Monad.void $ forkIO $ running newtid 0) done
+                unless closed $ running newtid 0
               else if isClosing then
                 closing newtid i'
               else
                 running newtid i'
               where
-                fold (isClosing,tid,i) msg =
+                fold (evs,c,isClosing,tid,i) msg =
                   case msg of
                     Persisted -> 
-                      pure (isClosing,tid,i - 1)
-
-                    Events f -> do
-                      es <- events' mh
-                      f es
-                      pure (isClosing,tid,i)
+                      pure (evs,c,isClosing,tid,i - 1)
 
                     Stream ev@(Write _ _ e) -> do
                       let newTid = tid + 1
-                      case cast e :: Maybe ev of
-                        Just ev -> record mh newTid ev
+                      e <- case cast e :: Maybe ev of
+                        Just ev -> pure ev
                         Nothing -> error "manager: Invariant broken; invalid message type"
                       writeChan ch (AggregatorEvent newTid ev)
-                      pure (False,newTid,i)
+                      let bs = BSB.lazyByteString (A.encode (newTid,e)) <> "\n"
+                      pure (evs <> bs,c + 1,False,newTid,i)
             
                     Stream ev@(Read _ _ _ _) -> do
                       writeChan ch (AggregatorEvent tid ev)
                       -- I think it's safe to keep closing with a read event in flight
-                      pure (isClosing,tid,i)
+                      pure (evs,c,isClosing,tid,i)
 
                     Stream ev@(Update _ _ _ e _) -> do
                       let newTid = tid + 1
-                      case cast e :: Maybe ev of
-                        Just ev -> record mh newTid ev
+                      e <- case cast e :: Maybe ev of
+                        Just ev -> pure ev
                         Nothing -> error "manager: Invariant broken; invalid message type"
                       writeChan ch (AggregatorEvent tid ev)
-                      pure (False,newTid,i)
-
-                    Stream (Log e _ f) -> do
-                      case cast f :: Maybe ([ev] -> IO ()) of
-                        Just g -> do
-                          es <- events' mh
-                          let l = List.length es
-                          l `seq` f es
-                        Nothing -> pure ()
-                      pure (isClosing,tid,i)
+                      let bs = BSB.lazyByteString (A.encode (newTid,e)) <> "\n"
+                      pure (evs <> bs,c + 1,False,newTid,i)
 
 data SorcererEnv = SorcererEnv 
   { listeners :: IntMap.IntMap [Listener] }
@@ -623,9 +578,9 @@ data SorcererMsg
   | SorcererEvent Event
 
 -- Get the current value of an aggregate.
-{-# INLINE read #-}
-read :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> IO (Maybe ag)
-read s = do
+{-# INLINE read' #-}
+read' :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> IO (Maybe ag)
+read' s = do
   let 
     !ev = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
     !ag = case typeRepFingerprint (typeOf (undefined :: ag)) of Fingerprint x _ -> fromIntegral x
@@ -633,12 +588,9 @@ read s = do
   publish (SorcererEvent (Read ev s ag (putMVar mv)))
   takeMVar mv
 
--- A version of read that ignores any unwritten updates and directly reads the aggregate from disk.
--- Useful to check for the existence of an aggregate without creating an empty stream and without the
--- possible overhead of stream-associated aggregates.
-{-# INLINE unsafeRead #-}
-unsafeRead :: forall ev ag. (FromJSON (Aggregate ag), Aggregable ev ag) => Stream ev -> IO (Maybe ag)
-unsafeRead s = do
+{-# INLINE read #-}
+read :: forall ev ag. (FromJSON (Aggregate ag), Aggregable ev ag) => Stream ev -> IO (Maybe ag)
+read s = do
   let fp = dropExtension (stream s) </> aggregate @ev @ag
   esemag <- try (A.decodeFileStrict fp)
   case esemag of
@@ -673,21 +625,28 @@ observe s ev = do
   publish (SorcererEvent (Update ety s aty ev (\before after -> putMVar mv (before,after))))
   takeMVar mv
 
-{-# INLINE events #-}
-events :: forall ev. (Hashable (Stream ev),Source ev) => Stream ev -> IO [ev]
-events s = do
+{-
+-- deprecated in favor of Fd approach to enable laziness and avoid opening aggregates
+{-# INLINE events' #-}
+events' :: forall ev. (Hashable (Stream ev),Source ev) => Stream ev -> IO [ev]
+events' s = do
   let !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of
               Fingerprint x _ -> fromIntegral x
   mv <- newEmptyMVar
   publish (SorcererEvent (Log ety s (putMVar mv)))
   takeMVar mv
+-}
 
-sorcerer :: [Listener] -> View
-sorcerer = sorcerer_ False
+-- lazily read events from a FD (to avoid GHCs single-writer OR multiple reader
+-- constraint). We know that all events (new lines) are immutable after commit,
+-- so it is safe to read those events, and we can stream them on demand.
+{-# INLINE events #-}
+events :: forall ev. (Hashable (Stream ev), Source ev) => Stream ev -> IO [ev]
+events s = try (getEvents (stream @ev s)) >>= either (\(_ :: SomeException) -> pure []) pure
 
 -- sorcerer_ True guarantees events are flushed and not buffered
-sorcerer_ :: Bool -> [Listener] -> View
-sorcerer_ tx ls = run app env
+sorcerer :: [Listener] -> View
+sorcerer ls = run app env
   where
     toListenerMap :: [Listener] -> IntMap.IntMap [Listener]
     toListenerMap ls = IntMap.fromListWith (++) [ (k,[l]) | l@(Listener (k,_) _ _) <- ls ]
@@ -744,7 +703,7 @@ sorcerer_ tx ls = run app env
                         mgr = (q_,st_)
                         managers = IntMap.singleton (hash s) mgr
                         done = publish (Done _ty (hash s))
-                      manager tx ls done s mgr
+                      manager ls done s mgr
                       pure mdl 
                         { sourcing = IntMap.insert _ty managers (sourcing mdl)
                         }
@@ -761,7 +720,7 @@ sorcerer_ tx ls = run app env
                             mgr = (q_,st_)
                             managers' = IntMap.insert (hash s) mgr managers
                             done = publish (Done _ty (hash s))
-                          manager tx ls done s mgr
+                          manager ls done s mgr
                           pure mdl 
                             { sourcing = IntMap.insert _ty managers' (sourcing mdl)
                             }
@@ -771,7 +730,6 @@ sorcerer_ tx ls = run app env
           case ev of
             Read _ty s  _ _    -> go _ty s
             Write _ty s _      -> go _ty s
-            Log _ty s _        -> go _ty s
             Update _ty s _ _ _ -> go _ty s
 
     view _ _ = Pure.Elm.Null
