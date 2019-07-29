@@ -2,7 +2,13 @@
   DeriveAnyClass, AllowAmbiguousTypes, TypeApplications, RecordWildCards, 
   MultiParamTypeClasses, FlexibleContexts, ExistentialQuantification, 
   DeriveGeneric, RankNTypes, LambdaCase, OverloadedStrings, PatternSynonyms #-}
-module Sorcerer (sorcerer,read,read',write,transact,observe,events,Listener,listener,Source(..),Aggregable(..),pattern Modify, pattern Ignore) where
+module Sorcerer 
+  (sorcerer
+  ,read,read',write,transact,observe,events
+  ,Listener,listener
+  ,Source(..),Aggregable(..)
+  ,pattern Updated, pattern Ignored, pattern Deleted
+  ) where
 
 import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write)
 
@@ -123,11 +129,14 @@ class (Hashable (Stream ev), Typeable ag, Source ev) => Aggregable ev ag where
 
   update :: ev -> Maybe ag -> Maybe (Maybe ag)
 
-pattern Modify :: a -> Maybe (Maybe a)
-pattern Modify a = Just (Just a)
+pattern Updated :: a -> Maybe (Maybe a)
+pattern Updated a = Just (Just a)
 
-pattern Ignore :: Maybe (Maybe a)
-pattern Ignore = Nothing
+pattern Deleted :: Maybe (Maybe a)
+pattern Deleted = Just Nothing
+
+pattern Ignored :: Maybe (Maybe a)
+pattern Ignored = Nothing
 
 --------------------------------------------------------------------------------
 -- Core event types for reading/writing aggregates.
