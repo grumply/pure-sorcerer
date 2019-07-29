@@ -220,7 +220,7 @@ commitAggregate fp tid = do
   P.closeFd fd
 
 {-# INLINE aggregator #-}
-aggregator :: forall ev ag. (ToJSON ag, FromJSON (Aggregate ag), ToJSON (Aggregate ag), Aggregable ev ag) 
+aggregator :: forall ev ag. (ToJSON ag, FromJSON ag, Aggregable ev ag) 
            => FilePath -> AggregatorEnv -> IO ()
 aggregator fp AggregatorEnv {..} = do
   createDirectoryIfMissing True (takeDirectory fp)
@@ -231,7 +231,7 @@ aggregator fp AggregatorEnv {..} = do
   where
     prepare :: IO (Aggregate ag)
     prepare = do
-      try (A.decodeFileStrict fp) >>= either synthesize synchronize
+      try (readAggregate fp) >>= either synthesize synchronize
       where
 
         synthesize :: SomeException -> IO (Aggregate ag)
@@ -239,11 +239,10 @@ aggregator fp AggregatorEnv {..} = do
           | aeLatest == 0 = pure (Aggregate 0 Nothing)
           | otherwise = fold 0 Nothing
 
-        synchronize :: Maybe (Aggregate ag) -> IO (Aggregate ag)
-        synchronize (Just ag)
+        synchronize :: Aggregate ag -> IO (Aggregate ag)
+        synchronize ag
           | aeLatest == aCurrent ag = pure ag
           | otherwise               = fold (aCurrent ag) (aAggregate ag)
-        synchronize Nothing         = fold 0 Nothing
 
         fold :: Int -> Maybe ag -> IO (Aggregate ag)
         fold from initial = do
@@ -311,7 +310,7 @@ data Listener = Listener
   }
 
 -- listener @SomeEvent @SomeAggregate
-listener :: forall ev ag. (ToJSON ag, FromJSON (Aggregate ag), ToJSON (Aggregate ag), Aggregable ev ag) => Listener
+listener :: forall ev ag. (ToJSON ag, FromJSON ag, Aggregable ev ag) => Listener
 listener = 
   let 
     ev = 
