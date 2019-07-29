@@ -216,7 +216,7 @@ commitAggregate fp tid = do
   let 
     stid = show tid
     commit = stid ++ (replicate (11 - List.length stid) ' ') ++ "\n"
-  P.fdWrite fd commit
+  !_ <- P.fdWrite fd commit
   P.closeFd fd
 
 {-# INLINE aggregator #-}
