@@ -121,7 +121,7 @@ class (Hashable (Stream ev), Typeable ag, Source ev) => Aggregable ev ag where
   aggregate :: FilePath
   aggregate = show (abs (hash (typeOf (undefined :: ag)))) <.> "aggregate"
 
-  update :: ev -> Maybe ag -> Maybe ag
+  update :: ev -> Maybe ag -> Maybe (Maybe ag)
 
 --------------------------------------------------------------------------------
 -- Core event types for reading/writing aggregates.
@@ -179,7 +179,7 @@ aggregator fp AggregatorEnv {..} = do
   Control.Monad.void $ forkIO $ do
     ag <- prepare 
     ms <- getChanContents aeMessages
-    foldM_ run ag ms
+    foldM_ run (False,ag) ms
   where
     prepare :: IO (Aggregate ag)
     prepare = do
@@ -202,42 +202,48 @@ aggregator fp AggregatorEnv {..} = do
           vs <- getEvents aeEvents
           let 
             diff = aeLatest - from
-            !mag = List.foldl' (flip (update @ev @ag)) initial (List.take diff $ List.drop from vs)
+            !mag = List.foldl' (\ag ev -> join $ update @ev @ag ev ag) initial (List.take diff $ List.drop from vs)
             !cur = Aggregate aeLatest mag
           A.encodeFile (fp <> ".temp") cur 
           renameFile (fp <> ".temp") fp
           pure cur
 
-    run :: Aggregate ag -> AggregatorMsg -> IO (Aggregate ag)
-    run cur@Aggregate {..} am =
+    run :: (Bool,Aggregate ag) -> AggregatorMsg -> IO (Bool,Aggregate ag)
+    run (!changed,cur@Aggregate {..}) am =
       case am of
         AggregatorEvent tid e ->
           case e of
             Write _ _ ev ->
               case cast ev of
-                Just e -> let !mag = (update @ev @ag) e aAggregate in pure (Aggregate tid mag)
+                Just e -> let !mmag = (update @ev @ag) e aAggregate 
+                              changed' = maybe False (const True) mmag
+                              mag = join mmag
+                           in pure (changed || changed',Aggregate tid mag)
                 _      -> error "aggregator.runner: invariant broken; received impossible write event"
 
             Read _ _ _ cb ->
               case cast cb :: Maybe (Maybe ag -> IO ()) of
-                Just f -> f aAggregate >> pure cur
+                Just f -> f aAggregate >> pure (changed,cur)
                 _      -> error "aggregator.runner: invariant broken; received impossible read event"
 
             Update _ _ _ ev cb ->
               case cast ev of
-                Just e -> let !mag = (update @ev @ag) e aAggregate 
+                Just e -> let !mmag = (update @ev @ag) e aAggregate 
+                              changed' = maybe False (const True) mmag
+                              mag = join mmag
                            in case cast cb :: Maybe (Maybe ag -> Maybe ag -> IO ()) of
-                                Just f  -> f aAggregate mag >> pure (Aggregate tid mag)
-                                Nothing -> pure (Aggregate tid mag)
+                                Just f  -> f aAggregate mag >> pure (changed || changed',Aggregate tid mag)
+                                Nothing -> pure (changed || changed',Aggregate tid mag)
                 Nothing -> error "aggregator.runner: invariant broken; received impossible update event"
 
         Persist persisted -> do
-          A.encodeFile (fp <> ".temp") cur 
-          renameFile (fp <> ".temp") fp
+          when changed $ do
+            A.encodeFile (fp <> ".temp") cur 
+            renameFile (fp <> ".temp") fp
           persisted 
-          pure cur
+          pure (changed,cur)
 
-        Shutdown -> myThreadId >>= killThread >> pure cur
+        Shutdown -> myThreadId >>= killThread >> pure (changed,cur)
 
 --------------------------------------------------------------------------------
 -- Abstract representation of an aggregator that ties into Source/Aggregable for
