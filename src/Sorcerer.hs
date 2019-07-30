@@ -7,10 +7,11 @@ module Sorcerer
   ,read,read',write,transact,observe,events
   ,Listener,listener
   ,Source(..),Aggregable(..)
-  ,pattern Updated, pattern Ignored, pattern Deleted
+  ,pattern Update, pattern Ignore, pattern Delete
+  ,pattern Added,pattern Updated, pattern Deleted, pattern Ignored
   ) where
 
-import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write)
+import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write,Delete)
 
 import Data.Aeson as A
 import qualified Data.ByteString as BS
@@ -129,14 +130,26 @@ class (Hashable (Stream ev), Typeable ag, Source ev) => Aggregable ev ag where
 
   update :: ev -> Maybe ag -> Maybe (Maybe ag)
 
-pattern Updated :: a -> Maybe (Maybe a)
-pattern Updated a = Just (Just a)
+pattern Update :: a -> Maybe (Maybe a)
+pattern Update a = Just (Just a)
 
-pattern Deleted :: Maybe (Maybe a)
-pattern Deleted = Just Nothing
+pattern Delete :: Maybe (Maybe a)
+pattern Delete = Just Nothing
 
-pattern Ignored :: Maybe (Maybe a)
-pattern Ignored = Nothing
+pattern Ignore :: Maybe (Maybe a)
+pattern Ignore = Nothing
+
+pattern Added :: a -> (Maybe a,Maybe (Maybe a))
+pattern Added a <- (Nothing,Just (Just a))
+
+pattern Updated :: a -> a -> (Maybe a,Maybe (Maybe a))
+pattern Updated a a' <- (Just a,Just (Just a'))
+
+pattern Deleted :: a -> (Maybe a,Maybe (Maybe a))
+pattern Deleted a <- (Just a,Just Nothing)
+
+pattern Ignored :: (Maybe a,Maybe (Maybe a)) 
+pattern Ignored <- (_,Nothing)
 
 --------------------------------------------------------------------------------
 -- Core event types for reading/writing aggregates.
@@ -153,12 +166,12 @@ data Event
     , _ag      :: {-# UNPACK #-}!Int
     , callback :: Maybe ag -> IO ()
     }
-  | forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Update
+  | forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Transact
     { _ty     :: {-# UNPACK #-}!Int
     , _ident  :: Stream ev
     , _ag     :: {-# UNPACK #-}!Int
     , event   :: ev
-    , inspect :: Maybe ag -> Maybe ag -> IO ()
+    , inspect :: Maybe ag -> Maybe (Maybe ag) -> IO ()
     }
 
 --------------------------------------------------------------------------------
@@ -273,13 +286,13 @@ aggregator fp AggregatorEnv {..} = do
                 Just f -> f aAggregate >> pure (changed,cur)
                 _      -> error "aggregator.runner: invariant broken; received impossible read event"
 
-            Update _ _ _ ev cb ->
+            Transact _ _ _ ev cb ->
               case cast ev of
                 Just e -> let !mmag = (update @ev @ag) e aAggregate 
                               changed' = maybe (maybe False (const True) aAggregate) (const True) mmag
                               mag = join mmag
-                           in case cast cb :: Maybe (Maybe ag -> Maybe ag -> IO ()) of
-                                Just f  -> f aAggregate mag >> pure (changed || changed',Aggregate tid mag)
+                           in case cast cb :: Maybe (Maybe ag -> Maybe (Maybe ag) -> IO ()) of
+                                Just f  -> f aAggregate mmag >> pure (changed || changed',Aggregate tid mag)
                                 Nothing -> pure (changed || changed',Aggregate tid mag)
                 Nothing -> error "aggregator.runner: invariant broken; received impossible update event"
 
@@ -569,7 +582,7 @@ manager ls done s mgr@(q_,st_) = do
                       writeChan ch (AggregatorEvent tid ev)
                       pure (evs,c,tid,i)
 
-                    Stream ev@(Update _ _ _ e _) -> do
+                    Stream ev@(Transact _ _ _ e _) -> do
                       let newTid = tid + 1
                       e <- case cast e :: Maybe ev of
                         Just ev -> pure ev
@@ -615,7 +628,7 @@ manager ls done s mgr@(q_,st_) = do
                       -- I think it's safe to keep closing with a read event in flight
                       pure (evs,c,isClosing,tid,i)
 
-                    Stream ev@(Update _ _ _ e _) -> do
+                    Stream ev@(Transact _ _ _ e _) -> do
                       let newTid = tid + 1
                       e <- case cast e :: Maybe ev of
                         Just ev -> pure ev
@@ -666,23 +679,23 @@ write s ev =
 
 -- Transactional version of write s ev >> read s.
 {-# INLINE transact #-}
-transact :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> ev -> IO (Maybe ag)
+transact :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> ev -> IO (Maybe (Maybe ag))
 transact s ev = do
   let
     !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
     !aty = case typeRepFingerprint (typeOf (undefined :: ag)) of Fingerprint x _ -> fromIntegral x
   mv <- newEmptyMVar
-  publish (SorcererEvent (Update ety s aty ev (\_ -> putMVar mv)))
+  publish (SorcererEvent (Transact ety s aty ev (\_ -> putMVar mv)))
   takeMVar mv
 
 {-# INLINE observe #-}
-observe :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> ev -> IO (Maybe ag,Maybe ag)
+observe :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> ev -> IO (Maybe ag,Maybe (Maybe ag))
 observe s ev = do
   let
     !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
     !aty = case typeRepFingerprint (typeOf (undefined :: ag)) of Fingerprint x _ -> fromIntegral x
   mv <- newEmptyMVar
-  publish (SorcererEvent (Update ety s aty ev (\before after -> putMVar mv (before,after))))
+  publish (SorcererEvent (Transact ety s aty ev (\before after -> putMVar mv (before,after))))
   takeMVar mv
 
 {-
@@ -790,7 +803,7 @@ sorcerer ls = run app env
           case ev of
             Read _ty s  _ _    -> go _ty s
             Write _ty s _      -> go _ty s
-            Update _ty s _ _ _ -> go _ty s
+            Transact _ty s _ _ _ -> go _ty s
 
     view _ _ = Pure.Elm.Null
 
