@@ -1,6 +1,6 @@
 {-# LANGUAGE ScopedTypeVariables, BangPatterns, DefaultSignatures, TypeFamilies,
   DeriveAnyClass, AllowAmbiguousTypes, TypeApplications, RecordWildCards, 
-  MultiParamTypeClasses, FlexibleContexts, ExistentialQuantification, 
+  MultiParamTypeClasses, FlexibleContexts, ExistentialQuantification, CPP,
   DeriveGeneric, RankNTypes, LambdaCase, OverloadedStrings, PatternSynonyms #-}
 module Sorcerer 
   (sorcerer
@@ -12,8 +12,12 @@ module Sorcerer
   ) where
 
 import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write,Delete)
+#ifdef __GHCJS__
+import Pure.Data.JSON
+#else
+import Data.Aeson
+#endif
 
-import Data.Aeson as A
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BS
 import qualified Data.ByteString.Lazy.Internal as BSL
@@ -53,6 +57,20 @@ import           System.Posix.Types       as P (Fd, FileOffset, ByteCount)
 import Foreign.Marshal
 import Foreign.ForeignPtr
 import Foreign.Ptr
+
+{-# INLINE encode_ #-}
+{-# INLINE decode_ #-}
+#ifdef __GHCJS__
+encode_ :: ToJSON a => a -> BSL.ByteString
+encode_ = fromTxt . encode . toJSON
+decode_ :: FromJSON a => BSL.ByteString -> Maybe a
+decode_ = decode . toTxt
+#else
+encode_ :: ToJSON a => a -> BSL.ByteString
+encode_ = encode
+decode_ :: FromJSON a => BSL.ByteString -> Maybe a
+decode_ = decode
+#endif
 
 --------------------------------------------------------------------------------
 -- Modified version of Neil Mitchell's `The Flavor of MVar` Queue from:
@@ -104,10 +122,7 @@ collect q_ =
 getEvents :: forall ev. Source ev => FilePath -> IO [ev]
 getEvents fp = do
   cnts <- BSLC.readFile fp
-  pure $ fmap snd $ catMaybes $ fmap decode_ $ List.drop 1 $ BSLC.lines cnts
-  where
-    decode_ :: BSL.ByteString -> Maybe (Int,ev)
-    decode_ = decode
+  pure $ fmap snd $ catMaybes $ fmap (decode_ @(Int,ev)) $ List.drop 1 $ BSLC.lines cnts
 
 --------------------------------------------------------------------------------
 -- Core Source/Aggregable types for defining event sourcing resources.
@@ -206,9 +221,9 @@ writeAggregate fp (Aggregate tid mag) = do
   fd <- P.openFd fp P.WriteOnly (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
   P.setFdOption fd P.SynchronousWrites True
   let 
-    stid = encode tid
+    stid = encode_ tid
     commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (11 - BSLC.length stid) ' ')
-    bsb = commit <> "\n" <> BSB.lazyByteString (encode mag)
+    bsb = commit <> "\n" <> BSB.lazyByteString (encode_ mag)
     (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
   withForeignPtr fptr $
     \wptr -> P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
@@ -225,7 +240,7 @@ readAggregateLazy fp = do
         (ln:rest) ->
           Just 
             ( Prelude.read (BSLC.unpack ln)
-            , A.decode (List.head rest)
+            , decode_ (List.head rest)
             )
         _ -> 
           Nothing
@@ -238,7 +253,7 @@ commitAggregate fp tid = do
   fd <- P.openFd fp P.WriteOnly (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
   P.setFdOption fd P.SynchronousWrites True
   let 
-    stid = encode tid
+    stid = encode_ tid
     commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (11 - BSLC.length stid) ' ')
     bsb = commit <> "\n"
     (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
@@ -400,7 +415,7 @@ resumeLog fd fp = do
         if sane then do
           findNthFromLastNewline 1
           ln <- fdGetLn
-          case A.decode (BSLC.pack ln) :: Maybe (Int,A.Value) of
+          case decode_ (BSLC.pack ln) :: Maybe (Int,Value) of
             Just (i,_) -> do
               commit i
               pure i
@@ -412,7 +427,7 @@ resumeLog fd fp = do
           P.fdWrite fd (List.replicate count ' ')
           _ <- findNthFromLastNewline 1
           ln <- fdGetLn
-          case A.decode (BSLC.pack ln) :: Maybe (Int,A.Value) of
+          case decode_ (BSLC.pack ln) :: Maybe (Int,Value) of
             Just (i,_) -> do
               commit i
               pure i
@@ -468,7 +483,7 @@ resumeLog fd fp = do
 {-# INLINE record #-}
 record :: ToJSON ev => P.Fd -> TransactionId -> ev -> IO ()
 record fd tid e = do
-  let (fptr, off, len) = BS.toForeignPtr (BSLC.toStrict $ A.encode (tid,e))
+  let (fptr, off, len) = BS.toForeignPtr (BSLC.toStrict $ encode_ (tid,e))
   withForeignPtr fptr $
     \wptr -> do
       P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
@@ -586,7 +601,7 @@ manager ls done s mgr@(q_,st_) = do
                         Just ev -> pure ev
                         Nothing -> error "manager: Invariant broken; invalid message type"
                       writeChan ch (AggregatorEvent newTid ev)
-                      let bs = BSB.lazyByteString (A.encode (newTid,e)) <> "\n"
+                      let bs = BSB.lazyByteString (encode_ (newTid,e)) <> "\n"
                       pure (evs <> bs,c + 1,newTid,i)
                     
                     Stream ev@(Read e _ a _) -> do
@@ -599,7 +614,7 @@ manager ls done s mgr@(q_,st_) = do
                         Just ev -> pure ev
                         Nothing -> error "manager: Invariant broken; invalid message type"
                       writeChan ch (AggregatorEvent tid ev)
-                      let bs = BSB.lazyByteString (A.encode (newTid,e)) <> "\n"
+                      let bs = BSB.lazyByteString (encode_ (newTid,e)) <> "\n"
                       pure (evs <> bs,c + 1,newTid,i)
 
             closing :: TransactionId -> Int -> IO ()
@@ -631,7 +646,7 @@ manager ls done s mgr@(q_,st_) = do
                         Just ev -> pure ev
                         Nothing -> error "manager: Invariant broken; invalid message type"
                       writeChan ch (AggregatorEvent newTid ev)
-                      let bs = BSB.lazyByteString (A.encode (newTid,e)) <> "\n"
+                      let bs = BSB.lazyByteString (encode_ (newTid,e)) <> "\n"
                       pure (evs <> bs,c + 1,False,newTid,i)
             
                     Stream ev@(Read _ _ _ _) -> do
@@ -645,7 +660,7 @@ manager ls done s mgr@(q_,st_) = do
                         Just ev -> pure ev
                         Nothing -> error "manager: Invariant broken; invalid message type"
                       writeChan ch (AggregatorEvent tid ev)
-                      let bs = BSB.lazyByteString (A.encode (newTid,e)) <> "\n"
+                      let bs = BSB.lazyByteString (encode_ (newTid,e)) <> "\n"
                       pure (evs <> bs,c + 1,False,newTid,i)
 
 data SorcererEnv = SorcererEnv 
@@ -680,7 +695,7 @@ read s = do
   if exists then do
     cnt <- BSLC.readFile fp
     case BSLC.lines cnt of
-      (_:ag:_) -> pure (A.decode ag)
+      (_:ag:_) -> pure (decode_ ag)
       _ -> pure Nothing
   else
     pure Nothing
