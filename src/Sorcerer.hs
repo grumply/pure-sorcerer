@@ -45,10 +45,11 @@ import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 
 import Prelude hiding (read)
+import qualified Prelude
 
 import qualified System.Posix.Files       as P
 import qualified System.Posix.IO          as P
-import           System.Posix.Types       as P (Fd, FileOffset)
+import           System.Posix.Types       as P (Fd, FileOffset, ByteCount)
 import Foreign.Marshal
 import Foreign.ForeignPtr
 import Foreign.Ptr
@@ -202,115 +203,124 @@ data AggregatorMsg
 {-# INLINE writeAggregate #-}
 writeAggregate :: ToJSON ag => FilePath -> Aggregate ag -> IO ()
 writeAggregate fp (Aggregate tid mag) = do
-  withFile fp WriteMode $ \h -> do
-    let 
-      stid = show tid
-      commit = stid ++ (replicate (11 - List.length stid) ' ')
-    hPutStrLn h commit
-    BSLC.hPut h (A.encode mag)
+  fd <- P.openFd fp P.WriteOnly (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
+  P.setFdOption fd P.SynchronousWrites True
+  let 
+    stid = encode tid
+    commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (11 - BSLC.length stid) ' ')
+    bsb = commit <> "\n" <> BSB.lazyByteString (encode mag)
+    (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
+  withForeignPtr fptr $
+    \wptr -> P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
+  P.closeFd fd
 
-{-# INLINE readAggregate #-}
-readAggregate :: FromJSON ag => FilePath -> IO (Aggregate ag)
-readAggregate fp = do
-  withFile fp ReadMode $ \h -> do
-    ln <- System.IO.hGetLine h
-    case readMaybe ln of
-      Nothing -> error "Could not read aggregate." 
-      Just transaction -> do
-        mmag <- A.decode <$> BSLC.hGetContents h
-        case mmag of
-          Nothing -> error "Could not read aggregate."
-          Just mag -> pure $ Aggregate transaction mag
+{-# INLINE readAggregateLazy #-}
+readAggregateLazy :: FromJSON ag => FilePath -> IO (Maybe (TransactionId,Maybe ag))
+readAggregateLazy fp = do
+  exists <- doesFileExist fp
+  if exists then do
+    cnts <- BSLC.readFile fp
+    pure $
+      case BSLC.lines cnts of
+        (ln:rest) ->
+          Just 
+            ( Prelude.read (BSLC.unpack ln)
+            , A.decode (List.head rest)
+            )
+        _ -> 
+          Nothing
+  else 
+    pure Nothing
 
 {-# INLINE commitAggregate #-}
 commitAggregate :: FilePath -> TransactionId -> IO ()
 commitAggregate fp tid = do
   fd <- P.openFd fp P.WriteOnly (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
+  P.setFdOption fd P.SynchronousWrites True
   let 
-    stid = show tid
-    commit = stid ++ (replicate (11 - List.length stid) ' ') ++ "\n"
-  !_ <- P.fdWrite fd commit
+    stid = encode tid
+    commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (11 - BSLC.length stid) ' ')
+    bsb = commit <> "\n"
+    (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
+  withForeignPtr fptr $
+    \wptr -> P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
   P.closeFd fd
 
 {-# INLINE aggregator #-}
-aggregator :: forall ev ag. (ToJSON ag, FromJSON ag, Aggregable ev ag) 
+aggregator :: forall ev ag. (ToJSON ag, FromJSON ag, Source ev, Aggregable ev ag) 
            => FilePath -> AggregatorEnv -> IO ()
 aggregator fp AggregatorEnv {..} = do
   createDirectoryIfMissing True (takeDirectory fp)
   Control.Monad.void $ forkIO $ do
-    ag <- prepare 
+    cag <- prepare
     ms <- getChanContents aeMessages
-    foldM_ run (False,ag) ms
+    foldM_ run cag ms
   where
-    prepare :: IO (Aggregate ag)
     prepare = do
-      try (readAggregate fp) >>= either synthesize synchronize
-      where
+      mtag <- readAggregateLazy fp
+      case mtag of
+        Nothing 
+          | aeLatest == 0 -> pure (True,True,Aggregate 0 Nothing) 
+          | otherwise -> do
+            evs0 :: [ev] <- getEvents aeEvents
+            let 
+              mkAggregatorEvent tid ev = AggregatorEvent tid (Write 0 undefined ev)
+              evs = zipWith mkAggregatorEvent [0 ..] evs0
+            foldM run (True,True,Aggregate 0 Nothing) evs
 
-        synthesize :: SomeException -> IO (Aggregate ag)
-        synthesize _ 
-          | aeLatest == 0 = pure (Aggregate 0 Nothing)
-          | otherwise = fold 0 Nothing
-
-        synchronize :: Aggregate ag -> IO (Aggregate ag)
-        synchronize ag
-          | aeLatest == aCurrent ag = pure ag
-          | otherwise               = fold (aCurrent ag) (aAggregate ag)
-
-        fold :: Int -> Maybe ag -> IO (Aggregate ag)
-        fold from initial = do
-          vs <- getEvents aeEvents
-          let 
-            diff = aeLatest - from
-            !mag = List.foldl' (\ag ev -> join $ update @ev @ag ev ag) initial (List.take diff $ List.drop from vs)
-            !cur = Aggregate aeLatest mag
-          writeAggregate (fp <> ".temp") cur
-          renameFile (fp <> ".temp") fp
-          pure cur
-
-    run :: (Bool,Aggregate ag) -> AggregatorMsg -> IO (Bool,Aggregate ag)
-    run (!changed,cur@Aggregate {..}) am =
+        Just ~(tid,mag) 
+          | tid == aeLatest -> pure (False,False,Aggregate tid mag)
+          | otherwise -> do
+            evs0 :: [ev] <- getEvents aeEvents
+            let 
+              mkAggregatorEvent tid ev = AggregatorEvent tid (Write 0 undefined ev)
+              evs = zipWith mkAggregatorEvent [aeLatest ..] (List.take (aeLatest - tid) (List.drop tid evs0))
+            foldM run (True,False,Aggregate tid mag) evs
+                   
+    run :: (Bool,Bool,Aggregate ag) -> AggregatorMsg -> IO (Bool,Bool,Aggregate ag)
+    run (shouldWriteTransaction,shouldWriteAggregate,cur) am =
       case am of
         AggregatorEvent tid e ->
           case e of
             Write _ _ ev ->
               case cast ev of
-                Just e -> let !mmag = (update @ev @ag) e aAggregate 
-                              changed' = maybe (maybe False (const True) aAggregate) (const True) mmag
-                              mag = join mmag
-                           in pure (changed || changed',Aggregate tid mag)
-                _      -> error "aggregator.runner: invariant broken; received impossible write event"
+                Just e -> do
+                  let mmag = (update @ev @ag) e (aAggregate  cur)
+                  pure (True,shouldWriteAggregate || isJust mmag,Aggregate tid (join mmag))
+                _ -> 
+                  error "aggregator.runner: invariant broken; received impossible write event"
 
-            Read _ _ _ cb ->
-              case cast cb :: Maybe (Maybe ag -> IO ()) of
-                Just f -> f aAggregate >> pure (changed,cur)
-                _      -> error "aggregator.runner: invariant broken; received impossible read event"
+            Read _ _ _ cb -> do
+              for_ (cast cb :: Maybe (Maybe ag -> IO ())) $ \f -> f (aAggregate cur)
+              pure (shouldWriteTransaction,shouldWriteAggregate,cur)
 
             Transact _ _ _ ev cb ->
               case cast ev of
-                Just e -> let !mmag = (update @ev @ag) e aAggregate 
-                              changed' = maybe (maybe False (const True) aAggregate) (const True) mmag
-                              mag = join mmag
-                           in case cast cb :: Maybe (Maybe ag -> Maybe (Maybe ag) -> IO ()) of
-                                Just f  -> f aAggregate mmag >> pure (changed || changed',Aggregate tid mag)
-                                Nothing -> pure (changed || changed',Aggregate tid mag)
-                Nothing -> error "aggregator.runner: invariant broken; received impossible update event"
+                Just e -> do
+                  let mmag = (update @ev @ag) e (aAggregate cur)
+                  for_ (cast cb :: Maybe (Maybe ag -> Maybe (Maybe ag) -> IO ())) $ \f -> 
+                    f (aAggregate cur) mmag 
+                  pure (True, shouldWriteAggregate || isJust mmag,Aggregate tid (join mmag))
+                Nothing -> 
+                  error "aggregator.runner: invariant broken; received impossible update event"
 
-        Persist persisted -> do
-          if changed then do
+        Persist persisted 
+          | shouldWriteAggregate -> do
             writeAggregate (fp <> ".temp") cur
             renameFile (fp <> ".temp") fp
-          else do
-            exists <- doesFileExist fp
-            if not exists then do
-              writeAggregate (fp <> ".temp") cur
-              renameFile (fp <> ".temp") fp
-            else
-              commitAggregate fp aCurrent
-          persisted 
-          pure (changed,cur)
+            persisted 
+            pure (False,False,cur)
+          | shouldWriteTransaction -> do
+            commitAggregate fp (aCurrent cur)
+            persisted
+            pure (False,False,cur)
+          | otherwise -> do
+            persisted
+            pure (False,False,cur)
 
-        Shutdown -> myThreadId >>= killThread >> pure (changed,cur)
+        Shutdown -> do
+          myThreadId >>= killThread
+          pure (False,False,cur)
 
 --------------------------------------------------------------------------------
 -- Abstract representation of an aggregator that ties into Source/Aggregable for
@@ -541,6 +551,7 @@ manager ls done s mgr@(q_,st_) = do
 
     initialize = do
       fd <- P.openFd fp P.ReadWrite (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
+      P.setFdOption fd P.SynchronousWrites True
       tid <- resumeLog @ev fd fp 
       chan <- startAggregators s fp tid ls
       start fd chan tid 
@@ -662,13 +673,17 @@ read' s = do
   takeMVar mv
 
 {-# INLINE read #-}
-read :: forall ev ag. (FromJSON (Aggregate ag), Aggregable ev ag) => Stream ev -> IO (Maybe ag)
+read :: forall ev ag. (FromJSON ag, Aggregable ev ag) => Stream ev -> IO (Maybe ag)
 read s = do
   let fp = dropExtension (stream s) </> aggregate @ev @ag
-  esemag <- try (A.decodeFileStrict fp)
-  case esemag of
-    Left (_ :: SomeException) -> pure Nothing
-    Right mag -> pure (join $ fmap aAggregate mag)
+  exists <- doesFileExist fp
+  if exists then do
+    cnt <- BSLC.readFile fp
+    case BSLC.lines cnt of
+      (_:ag:_) -> pure (A.decode ag)
+      _ -> pure Nothing
+  else
+    pure Nothing
 
 -- Write an event to an event stream.
 {-# INLINE write #-}
