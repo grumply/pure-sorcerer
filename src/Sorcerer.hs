@@ -1,14 +1,27 @@
 {-# LANGUAGE ScopedTypeVariables, BangPatterns, DefaultSignatures, TypeFamilies,
   DeriveAnyClass, AllowAmbiguousTypes, TypeApplications, RecordWildCards, 
   MultiParamTypeClasses, FlexibleContexts, ExistentialQuantification, CPP,
-  DeriveGeneric, RankNTypes, LambdaCase, OverloadedStrings, PatternSynonyms #-}
-module Sorcerer 
-  (sorcerer
+  DeriveGeneric, RankNTypes, LambdaCase, OverloadedStrings, PatternSynonyms,
+  ImplicitParams #-}
+module Sorcerer
+  (-- Storage layer
+   sorcerer
   ,read,read',write,transact,observe,events
   ,Listener,listener
   ,Source(..),Aggregable(..)
   ,pattern Update, pattern Ignore, pattern Delete
   ,pattern Added,pattern Updated, pattern Deleted, pattern Ignored
+
+  -- Pub/Sub layer
+  ,sorcery
+  ,Unlisten(..)
+  ,Event(..)
+  ,TargetedListener,listenTargeted,listenTargetedEvent
+  ,UntargetedListener,listenUntargeted,listenUntargetedEvent,listenUntargetedEvent'
+  ,subscribeStream,unsubscribeStream
+  ,subscribeStreamEvent,unsubscribeStreamEvent
+  ,subscribeStreams,unsubscribeStreams,unsubscribeStreams'
+  ,subscribeStreamsEvent,unsubscribeStreamsEvent,unsubscribeStreamsEvent'
   ) where
 
 import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write,Delete)
@@ -29,6 +42,7 @@ import qualified Data.ByteString.Builder as BSB
 import Control.Concurrent
 import Control.Exception
 import Control.Monad
+import Data.Bool
 import Data.Foldable
 import Data.Function
 import Data.List as List
@@ -864,3 +878,348 @@ test = sorcerer
   ]
 
 -}
+
+data SorceryEnv = SorceryEnv
+
+data SorceryModel = SorceryModel
+  { untargeted :: !(IntMap.IntMap                (IntMap.IntMap (Event -> IO Bool)))
+  , targeted   :: !(IntMap.IntMap (IntMap.IntMap (IntMap.IntMap (Event -> IO Bool))))
+  }
+
+data SorceryMsg
+  = StartupSorcery
+  | SorcererMsg SorcererMsg
+  | ListenUntargeted Int Int (Event -> IO Bool)
+  | UnlistenUntargeted Int Int 
+  | ListenTargeted Int Int Int (Event -> IO Bool)
+  | UnlistenTargeted Int Int Int 
+
+newtype TargetedListener = MkTargetedListener (IO ())
+newtype UntargetedListener = MkUntargetedListener (IO ())
+
+class Unlisten listener where
+  unlisten :: listener -> IO ()
+
+instance Unlisten TargetedListener where
+  unlisten (MkTargetedListener unl) = unl
+
+instance Unlisten UntargetedListener where
+  unlisten (MkUntargetedListener unl) = unl
+
+listenTargeted :: forall ev. Source ev => Stream ev -> (ev -> IO ()) -> IO TargetedListener
+listenTargeted st f = do
+  let
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+    h = hash st
+    g (Write _ _ ev) = 
+      case cast ev :: Maybe ev of
+        Just e -> f e
+        _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
+    g (Transact _ _ _ ev _) =
+      case cast ev :: Maybe ev of
+        Just e -> f e
+        _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
+    g _ = pure ()
+  u <- hashUnique <$> newUnique
+  publish (ListenTargeted ev h u (\ev -> g ev >> pure True))
+  pure (MkTargetedListener (publish $ UnlistenTargeted ev h u))
+
+listenUntargeted :: forall ev. Source ev => (ev -> IO ()) -> IO UntargetedListener
+listenUntargeted f = do
+  let
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+    g (Write _ _ ev) = 
+      case cast ev :: Maybe ev of
+        Just e -> f e >> pure True
+        _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
+    g (Transact _ _ _ ev _) = 
+      case cast ev :: Maybe ev of
+        Just e -> f e >> pure True
+        _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
+    g _ = pure True
+  u <- hashUnique <$> newUnique
+  publish (ListenUntargeted ev u (\ev -> g ev >> pure True))
+  pure (MkUntargetedListener (publish $ UnlistenUntargeted ev u))
+
+listenTargetedEvent :: forall ev. Source ev => Stream ev -> (Event -> IO ()) -> IO TargetedListener
+listenTargetedEvent st f = do
+  let
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+    h = hash st
+  u <- hashUnique <$> newUnique
+  publish (ListenTargeted ev h u (\ev -> f ev >> pure True))
+  pure (MkTargetedListener (publish $ UnlistenTargeted ev h u))
+
+listenUntargetedEvent :: forall ev. Source ev => (Event -> IO ()) -> IO UntargetedListener
+listenUntargetedEvent f = do
+  let
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+  u <- hashUnique <$> newUnique
+  publish (ListenUntargeted ev u (\ev -> f ev >> pure True))
+  pure (MkUntargetedListener (publish $ UnlistenUntargeted ev u))
+
+listenUntargetedEvent' :: forall ev. Source ev => Proxy ev -> (Event -> IO ()) -> IO UntargetedListener
+listenUntargetedEvent' _ f = listenUntargetedEvent @ev f
+
+subscribeStream :: forall ev msg. (Source ev, Elm msg) => (ev -> msg) -> Stream ev -> IO TargetedListener
+subscribeStream inj st = do
+  tid <- myThreadId
+  let 
+    htid = hash tid
+    u =
+      case signum htid of
+        1 -> negate htid
+        _ -> htid
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+    h = hash st
+    g (Write _ _ ev) = 
+      case cast ev :: Maybe ev of
+        Just e -> ?command (inj e)
+        _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
+    g (Transact _ _ _ ev _) =
+      case cast ev :: Maybe ev of
+        Just e -> ?command (inj e)
+        _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
+    g _ = pure True
+  publish (ListenTargeted ev h u g)
+  pure (MkTargetedListener (publish $ UnlistenTargeted ev h u))
+
+unsubscribeStream :: forall ev. Source ev => Stream ev -> IO ()
+unsubscribeStream st = do
+  tid <- myThreadId
+  let 
+    htid = hash tid
+    u =
+      case signum htid of
+        1 -> negate htid
+        _ -> htid
+    h = hash st
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+  publish (UnlistenTargeted ev h u)
+
+subscribeStreamEvent :: forall ev msg. (Source ev, Elm msg) => (Event -> msg) -> Stream ev -> IO TargetedListener
+subscribeStreamEvent inj st = do
+  tid <- myThreadId
+  let 
+    htid = hash tid
+    u =
+      case signum htid of
+        1 -> negate htid
+        _ -> htid
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+    h = hash st
+  publish (ListenTargeted ev h u (?command . inj))
+  pure (MkTargetedListener (publish $ UnlistenTargeted ev h u))
+
+unsubscribeStreamEvent :: forall ev. (Source ev) => Stream ev -> IO ()
+unsubscribeStreamEvent st = do
+  tid <- myThreadId
+  let 
+    htid = hash tid
+    u =
+      case signum htid of
+        1 -> negate htid
+        _ -> htid
+    h = hash st
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+  publish (UnlistenTargeted ev h u)
+
+subscribeStreams :: forall ev msg. (Source ev, Elm msg) => (ev -> msg) -> IO UntargetedListener
+subscribeStreams inj = do
+  tid <- myThreadId
+  let 
+    htid = hash tid
+    u =
+      case signum htid of
+        1 -> negate htid
+        _ -> htid
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+    g (Write _ _ ev) = 
+      case cast ev :: Maybe ev of
+        Just e -> ?command (inj e)
+        _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
+    g (Transact _ _ _ ev _) =
+      case cast ev :: Maybe ev of
+        Just e -> ?command (inj e)
+        _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
+    g _ = pure True
+  publish (ListenUntargeted ev u g)
+  pure (MkUntargetedListener (publish $ UnlistenUntargeted ev u))
+
+unsubscribeStreams :: forall ev. Source ev => IO ()
+unsubscribeStreams = do
+  tid <- myThreadId
+  let 
+    htid = hash tid
+    u =
+      case signum htid of
+        1 -> negate htid
+        _ -> htid
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+  publish (UnlistenUntargeted ev u)
+
+unsubscribeStreams' :: forall ev. Source ev => Proxy ev -> IO ()
+unsubscribeStreams' _ = unsubscribeStreams @ev
+
+subscribeStreamsEvent :: forall ev msg. (Source ev, Elm msg) => (Event -> msg) -> IO UntargetedListener
+subscribeStreamsEvent inj = do
+  tid <- myThreadId
+  let 
+    htid = hash tid
+    u =
+      case signum htid of
+        1 -> negate htid
+        _ -> htid
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+  publish (ListenUntargeted ev u (?command . inj))
+  pure (MkUntargetedListener (publish $ UnlistenUntargeted ev u))
+
+subscribeStreamsEvent' :: forall ev msg. (Source ev, Elm msg) => Proxy ev -> (Event -> msg) -> IO UntargetedListener
+subscribeStreamsEvent' _ inj = subscribeStreamsEvent @ev inj
+
+unsubscribeStreamsEvent :: forall ev. Source ev => IO ()
+unsubscribeStreamsEvent = do
+  tid <- myThreadId
+  let 
+    htid = hash tid
+    u =
+      case signum htid of
+        1 -> negate htid
+        _ -> htid
+    ev = 
+      case typeRepFingerprint (typeOf (undefined :: ev)) of
+        Fingerprint x _ -> fromIntegral x
+  publish (UnlistenUntargeted ev u)
+
+unsubscribeStreamsEvent' :: forall ev. Source ev => Proxy ev -> IO ()
+unsubscribeStreamsEvent' _ = unsubscribeStreamsEvent @ev
+
+-- Note about Listener ids:
+--  With Elm subscriptions, we hash the ThreadId of the subscriber and then guarantee it is negative by negating as necessary.
+--    This prevents multiple stream subscriptions from the same thread to the same stream or streams if untargeted, but simplifies
+--    the call to unsubscribe by not requiring storage of a TargetedListener or an UntargetedListener.
+--  With regular subscribers, we hash a unique which is guaranteed to be positive by the current (could change) hashUnique implementation.
+--    This allows any number of subscriptions, but requires storage of a TargetedListener/UntargetedListener
+--
+-- Basically, Listener IDs are positive if they're constructed via Uniques and negative if they're constructed via ThreadIds.
+sorcery :: View
+sorcery = run app env
+  where
+    env = SorceryEnv
+    app = App [StartupSorcery] [] [] mdl update view
+    mdl = SorceryModel mempty mempty
+    update :: Elm SorceryMsg => SorceryMsg -> SorceryEnv -> SorceryModel -> IO SorceryModel
+    update msg env !mdl =
+      case msg of
+        StartupSorcery -> do
+          subscribe
+          subscribeWith SorcererMsg
+          pure mdl
+
+        SorcererMsg (SorcererEvent ev) -> do
+          let 
+            (ty,h) =
+              case ev of
+                Read _ty st _ _       -> (_ty,hash st)
+                Write _ty st _        -> (_ty,hash st)
+                Transact _ty st _ _ _ -> (_ty,hash st)
+
+          untargeted' <-
+            case IntMap.lookup ty (untargeted mdl) of
+              Just ues -> do
+                results <- traverse ($ ev) ues
+                let 
+                  remove Nothing = Nothing
+                  remove (Just ufs) =
+                    let ufs' = IntMap.difference ufs (IntMap.filter not results)
+                     in bool Nothing (Just ufs') (IntMap.null ufs')
+                pure (IntMap.alter remove ty (untargeted mdl))
+              Nothing -> 
+                pure (untargeted mdl)
+
+          targeted' <- 
+            case IntMap.lookup ty (targeted mdl) of
+              Nothing -> pure (targeted mdl)
+              Just im ->
+                case IntMap.lookup h im of
+                  Just ues -> do
+                    results <- traverse ($ ev) ues
+                    let 
+                      remove Nothing = Nothing
+                      remove (Just stufs) = 
+                        let stufs' = IntMap.alter remove' h stufs
+                         in bool Nothing (Just stufs') (IntMap.null stufs')
+                      remove' Nothing = Nothing
+                      remove' (Just ufs) = 
+                        let ufs' = IntMap.difference ufs (IntMap.filter not results)
+                         in bool Nothing (Just ufs') (IntMap.null ufs')
+                    pure (IntMap.alter remove ty (targeted mdl))
+                  Nothing -> 
+                    pure (targeted mdl)
+
+          pure mdl { untargeted = untargeted', targeted = targeted' }
+
+        ListenUntargeted ty u f ->
+          let 
+            add Nothing    = Just $ IntMap.singleton u f
+            add (Just ufs) = Just $ IntMap.insert u f ufs
+           in 
+            pure mdl { untargeted = IntMap.alter add ty (untargeted mdl) }
+
+        UnlistenUntargeted ty u ->
+          let
+            remove Nothing = Nothing
+            remove (Just ufs) =
+              let ufs' = IntMap.delete u ufs
+               in bool Nothing (Just ufs') (IntMap.null ufs')
+           in
+            pure mdl { untargeted = IntMap.alter remove ty (untargeted mdl) }
+
+        ListenTargeted ty st u f ->
+          let 
+            add Nothing      = Just $ IntMap.singleton st (IntMap.singleton u f)
+            add (Just stufs) = Just $ IntMap.alter add' st stufs
+            add' Nothing     = Just $ IntMap.singleton u f
+            add' (Just ufs)  = Just $ IntMap.insert u f ufs
+           in
+            pure mdl { targeted = IntMap.alter add ty (targeted mdl) }
+
+        UnlistenTargeted ty st u ->
+          let 
+            remove Nothing = Nothing
+            remove (Just stufs) =
+              let stufs' = IntMap.alter remove' st stufs
+               in bool Nothing (Just stufs') (IntMap.null stufs')
+            remove' Nothing = Nothing
+            remove' (Just ufs) =
+              let ufs' = IntMap.delete u ufs
+               in bool Nothing (Just ufs') (IntMap.null ufs')
+           in 
+            pure mdl { targeted = IntMap.alter remove ty (targeted mdl) }
+
+        -- Other SorcererMsgs are ignored
+        _ -> pure mdl
+
+    view _ _ = Pure.Elm.Null
