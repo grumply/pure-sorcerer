@@ -314,8 +314,8 @@ aggregator fp AggregatorEnv {..} = do
             Write _ _ ev ->
               case cast ev of
                 Just e -> do
-                  let mmag = (update @ev @ag) e (aAggregate  cur)
-                  pure (True,shouldWriteAggregate || isJust mmag,Aggregate tid (join mmag))
+                  let mmag = (update @ev @ag) e (aAggregate cur)
+                  pure (True,shouldWriteAggregate || isJust mmag,Aggregate tid (fromMaybe (aAggregate cur) mmag))
                 _ -> 
                   error "aggregator.runner: invariant broken; received impossible write event"
 
@@ -329,7 +329,7 @@ aggregator fp AggregatorEnv {..} = do
                   let mmag = (update @ev @ag) e (aAggregate cur)
                   for_ (cast cb :: Maybe (Maybe ag -> Maybe (Maybe ag) -> IO ())) $ \f -> 
                     f (aAggregate cur) mmag 
-                  pure (True, shouldWriteAggregate || isJust mmag,Aggregate tid (join mmag))
+                  pure (True, shouldWriteAggregate || isJust mmag,Aggregate tid (fromMaybe (aAggregate cur) mmag))
                 Nothing -> 
                   error "aggregator.runner: invariant broken; received impossible update event"
 
