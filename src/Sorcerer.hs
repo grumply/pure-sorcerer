@@ -1154,7 +1154,7 @@ sorcery = run app env
                   remove Nothing = Nothing
                   remove (Just ufs) =
                     let ufs' = IntMap.difference ufs (IntMap.filter not results)
-                     in bool Nothing (Just ufs') (IntMap.null ufs')
+                     in bool (Just ufs') Nothing (IntMap.null ufs')
                 pure (IntMap.alter remove ty (untargeted mdl))
               Nothing -> 
                 pure (untargeted mdl)
@@ -1170,11 +1170,11 @@ sorcery = run app env
                       remove Nothing = Nothing
                       remove (Just stufs) = 
                         let stufs' = IntMap.alter remove' h stufs
-                         in bool Nothing (Just stufs') (IntMap.null stufs')
+                         in bool (Just stufs') Nothing (IntMap.null stufs')
                       remove' Nothing = Nothing
                       remove' (Just ufs) = 
                         let ufs' = IntMap.difference ufs (IntMap.filter not results)
-                         in bool Nothing (Just ufs') (IntMap.null ufs')
+                         in bool (Just ufs') Nothing (IntMap.null ufs')
                     pure (IntMap.alter remove ty (targeted mdl))
                   Nothing -> 
                     pure (targeted mdl)
@@ -1193,7 +1193,7 @@ sorcery = run app env
             remove Nothing = Nothing
             remove (Just ufs) =
               let ufs' = IntMap.delete u ufs
-               in bool Nothing (Just ufs') (IntMap.null ufs')
+               in bool (Just ufs') Nothing (IntMap.null ufs')
            in
             pure mdl { untargeted = IntMap.alter remove ty (untargeted mdl) }
 
@@ -1211,11 +1211,11 @@ sorcery = run app env
             remove Nothing = Nothing
             remove (Just stufs) =
               let stufs' = IntMap.alter remove' st stufs
-               in bool Nothing (Just stufs') (IntMap.null stufs')
+               in bool (Just stufs') Nothing (IntMap.null stufs')
             remove' Nothing = Nothing
             remove' (Just ufs) =
               let ufs' = IntMap.delete u ufs
-               in bool Nothing (Just ufs') (IntMap.null ufs')
+               in bool (Just ufs') Nothing (IntMap.null ufs')
            in 
             pure mdl { targeted = IntMap.alter remove ty (targeted mdl) }
 
