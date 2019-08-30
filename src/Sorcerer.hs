@@ -303,7 +303,7 @@ aggregator fp AggregatorEnv {..} = do
             evs0 :: [ev] <- getEvents aeEvents
             let 
               mkAggregatorEvent tid ev = AggregatorEvent tid (Write 0 undefined ev)
-              evs = zipWith mkAggregatorEvent [aeLatest ..] (List.take (aeLatest - tid) (List.drop tid evs0))
+              evs = zipWith mkAggregatorEvent [tid + 1 ..] (List.take (aeLatest - tid) (List.drop (tid + 1) evs0))
             foldM run (True,False,Aggregate tid mag) evs
                    
     run :: (Bool,Bool,Aggregate ag) -> AggregatorMsg -> IO (Bool,Bool,Aggregate ag)
@@ -1223,3 +1223,4 @@ sorcery = run app env
         _ -> pure mdl
 
     view _ _ = Pure.Elm.Null
+
