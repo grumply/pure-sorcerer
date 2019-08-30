@@ -307,14 +307,14 @@ aggregator fp AggregatorEnv {..} = do
             foldM run (True,False,Aggregate tid mag) evs
                    
     run :: (Bool,Bool,Aggregate ag) -> AggregatorMsg -> IO (Bool,Bool,Aggregate ag)
-    run (shouldWriteTransaction,shouldWriteAggregate,cur) am =
+    run (shouldWriteTransaction,!shouldWriteAggregate,cur) am =
       case am of
         AggregatorEvent tid e ->
           case e of
-            Write _ _ ev ->
+            Write _ _ ev -> do
               case cast ev of
                 Just e -> do
-                  let mmag = (update @ev @ag) e (aAggregate cur)
+                  let !mmag = (update @ev @ag) e (aAggregate cur)
                   pure (True,shouldWriteAggregate || isJust mmag,Aggregate tid (fromMaybe (aAggregate cur) mmag))
                 _ -> 
                   error "aggregator.runner: invariant broken; received impossible write event"
@@ -323,10 +323,10 @@ aggregator fp AggregatorEnv {..} = do
               for_ (cast cb :: Maybe (Maybe ag -> IO ())) $ \f -> f (aAggregate cur)
               pure (shouldWriteTransaction,shouldWriteAggregate,cur)
 
-            Transact _ _ _ ev cb ->
+            Transact _ _ _ ev cb -> do
               case cast ev of
                 Just e -> do
-                  let mmag = (update @ev @ag) e (aAggregate cur)
+                  let !mmag = (update @ev @ag) e (aAggregate cur)
                   for_ (cast cb :: Maybe (Maybe ag -> Maybe (Maybe ag) -> IO ())) $ \f -> 
                     f (aAggregate cur) mmag 
                   pure (True, shouldWriteAggregate || isJust mmag,Aggregate tid (fromMaybe (aAggregate cur) mmag))
@@ -581,7 +581,7 @@ manager ls done s mgr@(q_,st_) = do
     initialize = do
       fd <- P.openFd fp P.ReadWrite (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
       P.setFdOption fd P.SynchronousWrites True
-      tid <- resumeLog @ev fd fp 
+      !tid <- resumeLog @ev fd fp 
       chan <- startAggregators s fp tid ls
       start fd chan tid 
 
@@ -627,7 +627,7 @@ manager ls done s mgr@(q_,st_) = do
                       e <- case cast e :: Maybe ev of
                         Just ev -> pure ev
                         Nothing -> error "manager: Invariant broken; invalid message type"
-                      writeChan ch (AggregatorEvent tid ev)
+                      writeChan ch (AggregatorEvent newTid ev)
                       let bs = BSB.lazyByteString (encode_ (newTid,e)) <> "\n"
                       pure (evs <> bs,c + 1,newTid,i)
 
@@ -673,7 +673,7 @@ manager ls done s mgr@(q_,st_) = do
                       e <- case cast e :: Maybe ev of
                         Just ev -> pure ev
                         Nothing -> error "manager: Invariant broken; invalid message type"
-                      writeChan ch (AggregatorEvent tid ev)
+                      writeChan ch (AggregatorEvent newTid ev)
                       let bs = BSB.lazyByteString (encode_ (newTid,e)) <> "\n"
                       pure (evs <> bs,c + 1,False,newTid,i)
 
@@ -1223,4 +1223,6 @@ sorcery = run app env
         _ -> pure mdl
 
     view _ _ = Pure.Elm.Null
+
+
 
