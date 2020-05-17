@@ -24,7 +24,7 @@ module Sorcerer
   ,subscribeStreamsEvent,unsubscribeStreamsEvent,unsubscribeStreamsEvent'
   ) where
 
-import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write,Delete)
+import Pure.Elm hiding (Left,Right,(<.>),Listener,listeners,record,write,Delete,not,events)
 #ifdef __GHCJS__
 import Pure.Data.JSON
 #else
