@@ -236,7 +236,7 @@ writeAggregate fp (Aggregate tid mag) = do
   P.setFdOption fd P.SynchronousWrites True
   let 
     stid = encode_ tid
-    commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (11 - BSLC.length stid) ' ')
+    commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (10 - BSLC.length stid) ' ')
     bsb = commit <> "\n" <> BSB.lazyByteString (encode_ mag)
     (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
   withForeignPtr fptr $
@@ -268,7 +268,7 @@ commitAggregate fp tid = do
   P.setFdOption fd P.SynchronousWrites True
   let 
     stid = encode_ tid
-    commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (11 - BSLC.length stid) ' ')
+    commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (10 - BSLC.length stid) ' ')
     bsb = commit <> "\n"
     (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
   withForeignPtr fptr $
@@ -400,13 +400,13 @@ resumeLog fd fp = do
   where
     newStream :: IO TransactionId
     newStream = do
-      P.fdWrite fd "00          "
+      P.fdWrite fd "10         "
       pure 0
 
     recover :: IO TransactionId
     recover = do
       _ <- P.fdSeek fd AbsoluteSeek 0
-      (ln,_) <- P.fdRead fd 12
+      (ln,_) <- P.fdRead fd 11
       i <- 
         case ln of
           '1':tid ->
@@ -460,6 +460,14 @@ resumeLog fd fp = do
           (c,_) <- P.fdRead fd 1
           pure (c == "\n")
 
+        commit :: Int -> IO ()
+        commit c = do
+          P.fdSeek fd AbsoluteSeek 0
+          P.fdWrite fd (replicate 11 ' ' ++ "\n")
+          P.fdSeek fd AbsoluteSeek 0
+          P.fdWrite fd ('1':show c)
+          pure ()
+
         findNthFromLastNewline :: Int -> IO Int
         findNthFromLastNewline n = go 0 1
           where
@@ -473,14 +481,6 @@ resumeLog fd fp = do
                   go (i + 1) (p + 1)
               else
                 go i (p + 1)
-
-        commit :: Int -> IO ()
-        commit c = do
-          P.fdSeek fd AbsoluteSeek 0
-          P.fdWrite fd (replicate 11 ' ' ++ "\n")
-          P.fdSeek fd AbsoluteSeek 0
-          P.fdWrite fd ('1':show c)
-          pure ()
 
         fdGetLn :: IO String
         fdGetLn = lazyRead
