@@ -565,8 +565,11 @@ suspend (q_,st_) shutdown resume done =
 {-# INLINE dispatch #-}
 dispatch :: Manager -> ManagerMsg -> IO ()
 dispatch (q_,st_) msg = do
-  resumeManager st_ 
+  -- Be sure to arrive before resuming so that
+  -- the queue is not empty for the first run
+  -- of the manager's `running` loop
   arrive q_ msg
+  resumeManager st_ 
 
 -- Extra harmless whitespace may be possible in the stream file after a recovery.
 -- consider lazily initializing aggregators for read-heavy workloads
@@ -589,22 +592,43 @@ manager ls done s mgr@(q_,st_) = do
     start fd ch = \tid -> Control.Monad.void $ forkIO $ go tid 0
       where
         go :: TransactionId -> Int -> IO ()
-        go = running
+        go = running 
           where
-            running :: TransactionId -> Int -> IO ()
+            running :: TransactionId -- Current TransactionId
+                    -> Int           -- Awaiting Persisted messages from Aggregators
+                    -> IO ()
             running !tid !i = do
-              ms <- collect q_
-              (!evs',!c',!newtid,!i') <- foldM fold (mempty,0,tid,i) ms
-              isClosing <- withEmptyQueue q_ $
-                writeChan ch (Persist (arrive q_ Persisted))
-              when (c' > 0) $ do
-                records fd evs'
-                commit fd newtid
-              if isClosing then 
-                closing newtid (i' + count)
-              else 
-                running newtid i'
+              if i == 0 then do
+                empty <- isEmptyQueue q_
+                if empty then do
+                  -- This is guaranteed to not be the first instantiation of `running`
+                  writeChan ch (Persist (arrive q_ Persisted))
+                  closing tid (i + count)
+                else
+                  run
+              else
+                run
               where
+                run = do
+                  ms <- collect q_
+                  (!evs',!c',!newtid,!i') <- foldM fold (mempty,0,tid,i) ms
+                  isClosing <- withEmptyQueue q_ $
+                    writeChan ch (Persist (arrive q_ Persisted))
+                  when (c' > 0) $ do
+                    records fd evs'
+                    commit fd newtid
+                  if isClosing then 
+                    closing newtid (i' + count)
+                  else 
+                    running newtid i'
+
+                -- fold :: ( ByteStringBuilder -- Encoded events, ready to write to event stream file
+                --         , Int               -- Count of events to be written
+                --         , TransactionId     -- Current TransactionId, number of total events in stream
+                --         , Int               -- Number of Aggregators that have yet to ack w/ a Persisted msg
+                --         )
+                --      -> msg                 -- Current message to handle
+                --      -> (ByteStringBuilder,Int,TransactionId,Int) -- Result
                 fold (evs,c,tid,i) msg =
                   case msg of
                     Persisted -> 
@@ -647,7 +671,7 @@ manager ls done s mgr@(q_,st_) = do
                 unless closed $ running newtid 0
               else if isClosing then
                 closing newtid i'
-              else
+              else do
                 running newtid i'
               where
                 fold (evs,c,isClosing,tid,i) msg =
@@ -785,6 +809,10 @@ sorcerer ls = run app env
               case IntMap.lookup s managers of
                 Nothing  -> pure mdl
                 Just (q_,st_) -> do
+                  -- This code-path is where events would arrive in the queue;
+                  -- If there is nothing in the queue and the reciever has suspended itself
+                  -- with a `reopen` in the manager state, it is safe to assume that nothing
+                  -- can be in-flight for that stream manager or any aggregates thereof.
                   empty <- isEmptyQueue q_
                   if empty then do
                     ms <- takeMVar st_
@@ -793,6 +821,8 @@ sorcerer ls = run app env
                         putMVar st_ ms
                         pure mdl
                       Just _ -> do
+                        -- shutdown closes the stream FD and tells all aggregates to Shutdown, which
+                        -- simply induces a `myThreadId >>= killThread` in the aggregators
                         shutdown ms
                         pure mdl 
                           { sourcing =
