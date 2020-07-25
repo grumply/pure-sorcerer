@@ -379,8 +379,9 @@ listener =
 startAggregators :: Source ev => Stream ev -> FilePath -> TransactionId -> [Listener] -> IO (Chan AggregatorMsg)
 startAggregators s stream_fp tid ls = do
   chan <- newChan
-  for_ ls $ \(Listener i fp ag) -> do
-    ch <- dupChan chan
+  -- Must use the original chan for reading to prevent leaking
+  cs <- (chan:) <$> replicateM (List.length ls - 1) (dupChan chan)
+  for_ (zip ls cs) $ \(Listener i fp ag,ch) ->
     ag (dropExtension (stream s) </> fp) (AggregatorEnv stream_fp ch tid)
   pure chan
 
