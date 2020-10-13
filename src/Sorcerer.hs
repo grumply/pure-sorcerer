@@ -51,6 +51,7 @@ import Data.Typeable
 import Data.Unique
 import Data.Maybe
 import Data.Hashable
+import Foreign
 import GHC.Fingerprint
 import GHC.Generics
 import System.Directory
@@ -67,10 +68,7 @@ import qualified Prelude
 
 import qualified System.Posix.Files       as P
 import qualified System.Posix.IO          as P
-import           System.Posix.Types       as P (Fd, FileOffset, ByteCount)
-import Foreign.Marshal
-import Foreign.ForeignPtr
-import Foreign.Ptr
+import           System.Posix.Types       as P (Fd, FileOffset, ByteCount, COff)
 
 {-# INLINE encode_ #-}
 {-# INLINE decode_ #-}
@@ -233,14 +231,20 @@ data AggregatorMsg
 writeAggregate :: ToJSON ag => FilePath -> Aggregate ag -> IO ()
 writeAggregate fp (Aggregate tid mag) = do
   fd <- P.openFd fp P.WriteOnly (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
+
+  -- Just in case a write previously failed.
+  P.setFdSize fd 0
+
   P.setFdOption fd P.SynchronousWrites True
   let 
     stid = encode_ tid
-    commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (10 - BSLC.length stid) ' ')
+    tidl = succ (round (logBase 10 (fromIntegral tid)))
+    commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (12 - tidl) ' ')
     bsb = commit <> "\n" <> BSB.lazyByteString (encode_ mag)
     (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
-  withForeignPtr fptr $
-    \wptr -> P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
+
+  withForeignPtr fptr $ \wptr -> 
+    P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
   P.closeFd fd
 
 {-# INLINE readAggregateLazy #-}
@@ -262,17 +266,15 @@ readAggregateLazy fp = do
     pure Nothing
 
 {-# INLINE commitAggregate #-}
+-- This ONLY writes the transaction id.
+-- Assumes the transactionid is monotonically increasing!
 commitAggregate :: FilePath -> TransactionId -> IO ()
 commitAggregate fp tid = do
   fd <- P.openFd fp P.WriteOnly (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
   P.setFdOption fd P.SynchronousWrites True
-  let 
-    stid = encode_ tid
-    commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (10 - BSLC.length stid) ' ')
-    bsb = commit <> "\n"
-    (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
-  withForeignPtr fptr $
-    \wptr -> P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
+  let (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString (BSB.intDec tid)
+  withForeignPtr fptr $ \wptr -> 
+    P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
   P.closeFd fd
 
 {-# INLINE aggregator #-}
@@ -392,136 +394,102 @@ startAggregators s stream_fp tid ls = do
 resumeLog :: forall ev. Source ev => P.Fd -> FilePath -> IO TransactionId
 resumeLog fd fp = do
   off <- P.fdSeek fd SeekFromEnd 0
-  let eof = off == 0
-  if eof then 
-    newStream 
-  else 
-    recover
+  if off == 0 then newStream else resume
   where
+    -- Write statusline and return 0
     newStream :: IO TransactionId
     newStream = do
-      P.fdWrite fd "10         "
+      commit 0
       pure 0
 
-    recover :: IO TransactionId
-    recover = do
-      _ <- P.fdSeek fd AbsoluteSeek 0
-      (ln,_) <- P.fdRead fd 11
-      i <- 
-        case ln of
-          '1':tid ->
-            case readMaybe tid of
-              Nothing -> repair
-              Just i  -> pure i
-          '0':tid -> repair
-          _ -> error $ "manager: unrecoverable steram file " ++ fp
-
+    -- Commit a transaction id to the statusline
+    -- Has to write twice in case the transaction id is rolled back
+    commit :: Int -> IO ()
+    commit c = do
       P.fdSeek fd AbsoluteSeek 0
-      P.fdWrite fd "0"
+      P.fdWrite fd (replicate 13 ' ' ++ "\n")
+      P.fdSeek fd AbsoluteSeek 0
+      P.fdWrite fd ('1':show c)
       P.fdSeek fd SeekFromEnd 0
-
-      pure i
-
-    repair :: IO TransactionId
-    repair = do
-      sane <- hasTrailingNewline
-      end <- P.fdSeek fd SeekFromEnd 0
-      i <-
-        if sane then do
-          findNthFromLastNewline 1
-          ln <- fdGetLn
-          case decode_ (BSLC.pack ln) :: Maybe (Int,Value) of
-            Just (i,_) -> do
-              commit i
-              pure i
-            Nothing -> 
-              error $ "resumeLog.repair: unrecoverable event stream: " ++ fp
-        else do
-          off <- findNthFromLastNewline 0
-          let count = fromIntegral end - off
-          P.fdWrite fd (List.replicate count ' ')
-          _ <- findNthFromLastNewline 1
-          ln <- fdGetLn
-          case decode_ (BSLC.pack ln) :: Maybe (Int,Value) of
-            Just (i,_) -> do
-              commit i
-              pure i
-            Nothing ->
-              error $ "resumeLog.repair: unrecoverable event stream: " ++ fp
-         
-      P.fdSeek fd SeekFromEnd 0
-
-      pure i
-
-      where
-        hasTrailingNewline :: IO Bool
-        hasTrailingNewline = do
-          P.fdSeek fd SeekFromEnd (-1)
-          (c,_) <- P.fdRead fd 1
-          pure (c == "\n")
-
-        commit :: Int -> IO ()
-        commit c = do
-          P.fdSeek fd AbsoluteSeek 0
-          P.fdWrite fd (replicate 11 ' ' ++ "\n")
-          P.fdSeek fd AbsoluteSeek 0
-          P.fdWrite fd ('1':show c)
-          pure ()
-
-        findNthFromLastNewline :: Int -> IO Int
-        findNthFromLastNewline n = go 0 1
-          where
-            go i p = do
-              off <- P.fdSeek fd SeekFromEnd (fromIntegral $ negate p)
-              (c,_) <- P.fdRead fd 1
-              if c == "\n" then
-                if n == i then 
-                  pure (fromIntegral off + 1)
-                else
-                  go (i + 1) (p + 1)
-              else
-                go i (p + 1)
-
-        fdGetLn :: IO String
-        fdGetLn = lazyRead
-          where
-            lazyRead = unsafeInterleaveIO loop
-            loop = do
-              (s,_) <- P.fdRead fd 1
-              case s of
-                [] -> error "fdGetLn: failed to read full line"
-                ['\n'] -> pure []
-                ~[c] -> do
-                  cs <- lazyRead
-                  pure (c:cs)
-
-{-# INLINE record #-}
-record :: ToJSON ev => P.Fd -> TransactionId -> ev -> IO ()
-record fd tid e = do
-  let (fptr, off, len) = BS.toForeignPtr (BSLC.toStrict $ encode_ (tid,e))
-  withForeignPtr fptr $
-    \wptr -> do
-      P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
-      P.fdWrite fd "\n"
       pure ()
 
+    resume :: IO TransactionId
+    resume = do
+      _ <- P.fdSeek fd AbsoluteSeek 0
+      (ln,_) <- P.fdRead fd 13
+      i <- 
+        case ln of
+          '1':tid | Just i <- readMaybe tid -> pure i
+          _  :tid                           -> recover
+      P.fdSeek fd SeekFromEnd 0
+      pure i
+
+    -- Recoverable failures:
+    --   1. Power failed before transaction write completed; delete unfinished transaction and attempt to roll back to the previous transaction.
+    --   2. Power failed during transaction commit; verify the latest transaction and attempt to commit it.
+    recover :: IO TransactionId
+    recover = do
+      (o,ln) <- fdGetLnReverse (-1)
+      case decode_ (BSLC.pack ln) :: Maybe (Int,Value) of
+        Just (i,_) -> do
+          commit i
+          pure i
+        Nothing -> do
+          (_,ln) <- fdGetLnReverse o
+          case decode_ (BSLC.pack ln) :: Maybe (Int,Value) of
+            Just (i,_) -> do
+              off <- P.fdSeek fd SeekFromEnd (o + 2) -- must not truncate the newline
+              P.setFdSize fd off
+              commit i
+              pure i
+            Nothing -> error $ Prelude.unlines
+              [ "Sorcerer.resumeLog.resume.recover:" 
+              , ""
+              ,     "\tUnrecoverable event stream: "
+              , ""
+              ,     "\t\t" ++ fp
+              , ""
+              ,     "\tProblem:"
+              ,     "\t\tThe latest commit was partial and the previous commit was not valid JSON."
+              , ""
+              ,     "\tSolution:"
+              ,     "\t\tUnknown. This should not be possible using aeson for encoding." 
+              ,     "\t\tReview the transaction stream manually to determine a solution." 
+              ]
+      where
+        fdGetLnReverse :: FileOffset -> IO (FileOffset,String)
+        fdGetLnReverse i = alloca $ \p -> go p [] i
+          where
+            go p = go'
+              where
+                go' s i = do
+                  P.fdSeek fd SeekFromEnd i
+                  P.fdReadBuf fd p 1
+                  w <- peek p
+                  let c = toEnum (fromIntegral w)
+                  if c == '\n'
+                    then pure (i - 1,s)
+                    else go' (c:s) (i-1)
+
 {-# INLINE records #-}
+-- Assumes fd is at (SeekFromEnd 0)
 records :: P.Fd -> BSB.Builder -> IO ()
 records fd bsb = do
   let (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
-  !i <- withForeignPtr fptr $
-    \wptr -> P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
+  !i <- withForeignPtr fptr $ \wptr -> 
+    P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
   pure ()
 
 {-# INLINE commit #-}
+-- Assumes monotonically increasing transaction id in a valid transaction log
 commit :: P.Fd -> TransactionId -> IO ()
 commit fd tid = do
-  P.fdSeek fd AbsoluteSeek 0
   let 
-    commitString = 
-      let str = show tid
-      in '1':str ++ (replicate (10 - List.length str) ' ')
-  P.fdWrite fd (commitString ++ "\n")
+    bsb = BSB.intDec 1 <> BSB.intDec tid
+    (fptr,off,len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
+  P.fdSeek fd AbsoluteSeek 0
+  !i <- withForeignPtr fptr $ \wptr ->
+    P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
   P.fdSeek fd SeekFromEnd 0
   pure ()
 
@@ -851,10 +819,14 @@ sorcerer ls = run app env
                         mgr = (q_,st_)
                         managers = IntMap.singleton (hash s) mgr
                         done = publish (Done _ty (hash s))
-                      manager ls done s mgr
-                      pure mdl 
-                        { sourcing = IntMap.insert _ty managers (sourcing mdl)
-                        }
+                      er <- try (manager ls done s mgr)
+                      case er of
+                        Left (r :: SomeException) -> do
+                          print r
+                          pure mdl
+                        Right tid -> 
+                          pure mdl 
+                            { sourcing = IntMap.insert _ty managers (sourcing mdl) }
                 Just managers ->
                   case IntMap.lookup (hash s) managers of
                     Nothing ->
@@ -868,10 +840,15 @@ sorcerer ls = run app env
                             mgr = (q_,st_)
                             managers' = IntMap.insert (hash s) mgr managers
                             done = publish (Done _ty (hash s))
-                          manager ls done s mgr
-                          pure mdl 
-                            { sourcing = IntMap.insert _ty managers' (sourcing mdl)
-                            }
+                          er <- try (manager ls done s mgr)
+                          case er of
+                            Left (r :: SomeException) -> do
+                              print r
+                              pure mdl
+                            Right tid ->
+                              pure mdl 
+                                { sourcing = IntMap.insert _ty managers' (sourcing mdl)
+                                }
                     Just mgr -> do
                       dispatch mgr (Stream ev)
                       pure mdl
