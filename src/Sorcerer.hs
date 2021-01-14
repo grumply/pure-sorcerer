@@ -992,11 +992,11 @@ subscribeStream inj st = do
     h = hash st
     g (Write _ _ ev) = 
       case cast ev :: Maybe ev of
-        Just e -> ?command (inj e)
+        Just e -> ?command (inj e) (pure ())
         _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
     g (Transact _ _ _ ev _) =
       case cast ev :: Maybe ev of
-        Just e -> ?command (inj e)
+        Just e -> ?command (inj e) (pure ())
         _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
     g _ = pure True
   publish (ListenTargeted ev h u g)
@@ -1030,7 +1030,7 @@ subscribeStreamEvent inj st = do
       case typeRepFingerprint (typeOf (undefined :: ev)) of
         Fingerprint x _ -> fromIntegral x
     h = hash st
-  publish (ListenTargeted ev h u (?command . inj))
+  publish (ListenTargeted ev h u (flip ?command (pure ()). inj))
   pure (MkTargetedListener (publish $ UnlistenTargeted ev h u))
 
 unsubscribeStreamEvent :: forall ev. (Source ev) => Stream ev -> IO ()
@@ -1062,11 +1062,11 @@ subscribeStreams inj = do
         Fingerprint x _ -> fromIntegral x
     g (Write _ _ ev) = 
       case cast ev :: Maybe ev of
-        Just e -> ?command (inj e)
+        Just e -> ?command (inj e) (pure ())
         _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
     g (Transact _ _ _ ev _) =
       case cast ev :: Maybe ev of
-        Just e -> ?command (inj e)
+        Just e -> ?command (inj e) (pure ())
         _ -> error "Sorcerer: Invariant broken: mistargeted listener event"
     g _ = pure True
   publish (ListenUntargeted ev u g)
@@ -1101,7 +1101,7 @@ subscribeStreamsEvent inj = do
     ev = 
       case typeRepFingerprint (typeOf (undefined :: ev)) of
         Fingerprint x _ -> fromIntegral x
-  publish (ListenUntargeted ev u (?command . inj))
+  publish (ListenUntargeted ev u (flip ?command (pure ()) . inj))
   pure (MkUntargetedListener (publish $ UnlistenUntargeted ev u))
 
 subscribeStreamsEvent' :: forall ev msg. (Source ev, Elm msg) => Proxy ev -> (Event -> msg) -> IO UntargetedListener
