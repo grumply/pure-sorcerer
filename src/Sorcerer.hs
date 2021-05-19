@@ -42,6 +42,7 @@ import qualified Data.ByteString.Builder as BSB
 import Control.Concurrent
 import Control.Exception
 import Control.Monad
+import Control.Monad.IO.Class
 import Data.Bool
 import Data.Foldable
 import Data.Function
@@ -685,8 +686,8 @@ data SorcererMsg
 
 -- Get the current value of an aggregate.
 {-# INLINE read' #-}
-read' :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> IO (Maybe ag)
-read' s = do
+read' :: forall ev m ag. (MonadIO m, Hashable (Stream ev), Aggregable ev ag) => Stream ev -> m (Maybe ag)
+read' s = liftIO $ do
   let 
     !ev = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
     !ag = case typeRepFingerprint (typeOf (undefined :: ag)) of Fingerprint x _ -> fromIntegral x
@@ -695,8 +696,8 @@ read' s = do
   takeMVar mv
 
 {-# INLINE read #-}
-read :: forall ev ag. (FromJSON ag, Aggregable ev ag) => Stream ev -> IO (Maybe ag)
-read s = do
+read :: forall ev m ag. (MonadIO m, FromJSON ag, Aggregable ev ag) => Stream ev -> m (Maybe ag)
+read s = liftIO $ do
   let fp = dropExtension (stream s) </> aggregate @ev @ag
   exists <- doesFileExist fp
   if exists then do
@@ -709,15 +710,15 @@ read s = do
 
 -- Write an event to an event stream.
 {-# INLINE write #-}
-write :: forall ev. (Hashable (Stream ev), Source ev) => Stream ev -> ev -> IO ()
+write :: forall ev m. (MonadIO m, Hashable (Stream ev), Source ev) => Stream ev -> ev -> m ()
 write s ev = 
   let !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
-  in publish (SorcererEvent (Write ety s ev))
+  in liftIO (publish (SorcererEvent (Write ety s ev)))
 
 -- Transactional version of write s ev >> read s.
 {-# INLINE transact #-}
-transact :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> ev -> IO (Maybe (Maybe ag))
-transact s ev = do
+transact :: forall ev m ag. (MonadIO m, Hashable (Stream ev), Aggregable ev ag) => Stream ev -> ev -> m (Maybe (Maybe ag))
+transact s ev = liftIO $ do
   let
     !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
     !aty = case typeRepFingerprint (typeOf (undefined :: ag)) of Fingerprint x _ -> fromIntegral x
@@ -726,8 +727,8 @@ transact s ev = do
   takeMVar mv
 
 {-# INLINE observe #-}
-observe :: forall ev ag. (Hashable (Stream ev), Aggregable ev ag) => Stream ev -> ev -> IO (Maybe ag,Maybe (Maybe ag))
-observe s ev = do
+observe :: forall ev m ag. (MonadIO m, Hashable (Stream ev), Aggregable ev ag) => Stream ev -> ev -> m (Maybe ag,Maybe (Maybe ag))
+observe s ev = liftIO $ do
   let
     !ety = case typeRepFingerprint (typeOf (undefined :: ev)) of Fingerprint x _ -> fromIntegral x
     !aty = case typeRepFingerprint (typeOf (undefined :: ag)) of Fingerprint x _ -> fromIntegral x
@@ -751,8 +752,8 @@ events' s = do
 -- constraint). We know that all events (new lines) are immutable after commit,
 -- so it is safe to read those events, and we can stream them on demand.
 {-# INLINE events #-}
-events :: forall ev. (Hashable (Stream ev), Source ev) => Stream ev -> IO [ev]
-events s = try (getEvents (stream @ev s)) >>= either (\(_ :: SomeException) -> pure []) pure
+events :: forall ev m. (MonadIO m, Hashable (Stream ev), Source ev) => Stream ev -> m [ev]
+events s = liftIO (try (getEvents (stream @ev s)) >>= either (\(_ :: SomeException) -> pure []) pure)
 
 -- sorcerer_ True guarantees events are flushed and not buffered
 sorcerer :: [Listener] -> View
