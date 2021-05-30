@@ -761,7 +761,7 @@ sorcerer ls = run app env
   where
     toListenerMap :: [Listener] -> IntMap.IntMap [Listener]
     toListenerMap ls = IntMap.fromListWith (++) [ (k,[l]) | l@(Listener (k,_) _ _) <- ls ]
-    app = App [Startup] [] [] mdl update view
+    app = App [Startup] [] [] (pure mdl) update view
     mdl = SorcererModel mempty
     env = SorcererEnv (toListenerMap ls)
     update :: Elm SorcererMsg => SorcererMsg -> SorcererEnv -> SorcererModel -> IO SorcererModel
@@ -1137,7 +1137,7 @@ sorcery :: View
 sorcery = run app env
   where
     env = SorceryEnv
-    app = App [StartupSorcery] [] [] mdl update view
+    app = App [StartupSorcery] [] [] (pure mdl) update view
     mdl = SorceryModel mempty mempty
     update :: Elm SorceryMsg => SorceryMsg -> SorceryEnv -> SorceryModel -> IO SorceryModel
     update msg env !mdl =
