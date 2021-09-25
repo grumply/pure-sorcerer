@@ -30,6 +30,6 @@ library
 
 
   exposed-modules:
-    Sorcerer
+    Pure.Sorcerer
 
   default-language: Haskell2010
