@@ -1,6 +1,6 @@
-name:              sorcerer
+name:              pure-sorcerer
 version:           0.8.0.0
-homepage:          purehs.org/doc/sorcerer
+homepage:          purehs.org/doc/pure-sorcerer
 author:            Sean Hickman
 maintainer:        sean@grumply.com
 license:           BSD3
@@ -10,7 +10,7 @@ build-type:        Simple
 
 source-repository head
   type: git
-  location: https://github.com/grumply/sorcerer.git
+  location: https://github.com/grumply/pure-sorcerer.git
 
 library
   hs-source-dirs:

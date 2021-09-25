@@ -3,7 +3,7 @@
   MultiParamTypeClasses, FlexibleContexts, ExistentialQuantification, CPP,
   DeriveGeneric, RankNTypes, LambdaCase, OverloadedStrings, PatternSynonyms,
   ImplicitParams #-}
-module Sorcerer
+module Pure.Sorcerer
   (-- Storage layer
    sorcerer
   ,read,read',write,transact,observe,events
