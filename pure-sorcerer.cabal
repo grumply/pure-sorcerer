@@ -20,6 +20,8 @@ library
       base
     , pure-elm
     , pure-json
+    , pure-time
+    , pure-txt
     , bytestring
     , directory
     , filepath
@@ -28,8 +30,53 @@ library
     , aeson
     , unix
 
-
   exposed-modules:
     Pure.Sorcerer
+    Pure.Sorcerer.Aggregable
+    Pure.Sorcerer.Aggregate
+    Pure.Sorcerer.Aggregator
+    Pure.Sorcerer.Dispatcher
+    Pure.Sorcerer.JSON
+    Pure.Sorcerer.Log
+    Pure.Sorcerer.Manager
+    Pure.Sorcerer.Queue
+    Pure.Sorcerer.Streamable
+    Pure.Sorcerer.Sorcery
 
   default-language: Haskell2010
+
+  default-extensions:
+    DerivingStrategies
+    TypeFamilies
+    FlexibleContexts
+    UndecidableInstances
+    DeriveGeneric
+    DeriveAnyClass
+    FlexibleInstances
+    TemplateHaskell
+    AllowAmbiguousTypes
+    RankNTypes
+    DataKinds
+    PartialTypeSignatures
+    TypeApplications
+    ScopedTypeVariables
+    DuplicateRecordFields
+    StandaloneDeriving
+    MultiParamTypeClasses
+    NamedFieldPuns
+    RecordWildCards
+    PatternSynonyms
+    BlockArguments
+    LambdaCase
+    CPP
+    DerivingVia
+    OverloadedStrings
+    DefaultSignatures
+    TypeOperators
+    InstanceSigs
+    ExistentialQuantification
+    RoleAnnotations
+    FunctionalDependencies
+    ViewPatterns
+    BangPatterns
+    ConstraintKinds
