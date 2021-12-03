@@ -29,6 +29,7 @@ library
     , containers
     , aeson
     , unix
+    , unix-bytestring
 
   exposed-modules:
     Pure.Sorcerer

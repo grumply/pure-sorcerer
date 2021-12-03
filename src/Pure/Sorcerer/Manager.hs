@@ -70,7 +70,6 @@ startManager builder sm@(StreamManager (stream,callback)) =
       (log,tid) <- resume @ev fp
       aggregators <- builder stream tid
       run q log aggregators tid
-      close log
   where
     run :: Queue Event -> Log -> [Aggregator ev] -> TransactionId -> IO ()
     run events log = running 0 mempty
@@ -85,8 +84,7 @@ startManager builder sm@(StreamManager (stream,callback)) =
           tryTimeout (collect events) >>= \case
             Nothing -> do
               when (count > 0) do
-                record log evs
-                commit log tid
+                record log evs tid
               ags' <- traverse persist ags
               did <- tryShutdown
               unless did do
@@ -95,8 +93,7 @@ startManager builder sm@(StreamManager (stream,callback)) =
             Just ms -> do
               (count',evs',ags',tid') <- foldM fold (count,evs,ags,tid) ms
               if count' >= (batch @ev) then do
-                record log evs'
-                commit log tid'
+                record log evs' tid'
                 running 0 mempty ags' tid'
               else
                 running count' evs' ags' tid'
@@ -105,6 +102,7 @@ startManager builder sm@(StreamManager (stream,callback)) =
           cb <- takeMVar callback
           empty <- isEmptyQueue events
           if empty then do
+            close log
             removeStreamManager sm
             pure True
           else do

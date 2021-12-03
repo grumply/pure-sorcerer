@@ -2,7 +2,6 @@ module Pure.Sorcerer.Log
   ( Log
   , resume
   , record
-  , commit
   , close
   ) where
 
@@ -16,10 +15,12 @@ import qualified Data.ByteString.Internal as BS
 import qualified Data.ByteString.Lazy.Builder as BSB
 import qualified Data.ByteString.Lazy.Char8 as BSLC
 
-import qualified System.Posix.Files       as P
-import qualified System.Posix.IO          as P
-import           System.Posix.Types       as P (Fd, FileOffset, ByteCount, COff)
+import qualified System.Posix.Files              as P
+import qualified System.Posix.IO                 as P
+import qualified System.Posix.IO.ByteString.Lazy as P (fdWrites)
+import           System.Posix.Types              as P (Fd, FileOffset, ByteCount, COff)
 
+import Control.Monad
 import Foreign.Ptr
 import Foreign.ForeignPtr
 import Foreign.Marshal.Alloc
@@ -32,7 +33,6 @@ newtype Log = Log P.Fd
 resume :: forall ev. Streamable ev => FilePath -> IO (Log,TransactionId)
 resume fp = do
   fd <- P.openFd fp P.ReadWrite (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
-  P.setFdOption fd P.SynchronousWrites True
   !tid <- resumeLog @ev fd fp 
   pure (Log fd,tid)
 
@@ -116,25 +116,20 @@ resumeLog fd fp = do
                     then pure (i - 1,s)
                     else go' (c:s) (i-1)
 
--- Assumes fd is at (SeekFromEnd 0)
-record :: Log -> BSB.Builder -> IO ()
-record (Log fd) bsb = do
-  let (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
-  !i <- withForeignPtr fptr $ \wptr -> 
-    P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
-  pure ()
+record :: Log -> BSB.Builder -> TransactionId -> IO ()
+record (Log fd) bsb tid = void do
 
--- Assumes monotonically increasing transaction id in a valid transaction log
-commit :: Log -> TransactionId -> IO ()
-commit (Log fd) tid = do
-  let 
-    bsb = BSB.intDec 1 <> BSB.intDec tid
-    (fptr,off,len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
+  -- seek to beginning and tag event log as uncommited
   P.fdSeek fd AbsoluteSeek 0
-  !i <- withForeignPtr fptr $ \wptr ->
-    P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
+  P.fdWrites fd (BSB.toLazyByteString (BSB.intDec 0 <> BSB.intDec tid))
+
+  -- seek to end and write events
   P.fdSeek fd SeekFromEnd 0
-  pure ()
+  P.fdWrites fd (BSB.toLazyByteString bsb)
+
+  -- seek to beginning and tag event log as commited 
+  P.fdSeek fd AbsoluteSeek 0
+  P.fdWrites fd (BSB.toLazyByteString (BSB.intDec 1))
 
 close :: Log -> IO ()
 close (Log fd) = P.closeFd fd
