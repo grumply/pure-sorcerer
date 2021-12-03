@@ -11,7 +11,7 @@ import qualified Data.ByteString.Lazy.Char8 as BSLC
 
 import qualified System.Posix.Files as P
 import qualified System.Posix.IO as P
-#ifdef __GHC__
+#ifndef __GHCJS__
 import qualified System.Posix.IO.ByteString.Lazy as P (fdWrites)
 #endif
 import System.Posix.Types as P (Fd, FileOffset, ByteCount, COff)
@@ -44,7 +44,7 @@ writeAggregate fp tid mag = do
     commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (12 - tidl) ' ')
     bsb = commit <> "\n" <> BSB.lazyByteString (encode_ mag)
 
-#ifdef __GHC__
+#ifndef __GHCJS__
   P.fdWrites fd (BSB.toLazyByteString bsb)
 #endif
 
@@ -67,7 +67,7 @@ commitTransaction :: FilePath -> TransactionId -> IO ()
 commitTransaction fp tid = do
   fd <- P.openFd fp P.WriteOnly (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
   P.setFdOption fd P.SynchronousWrites True
-#ifdef __GHC__
+#ifndef __GHCJS__
   P.fdWrites fd (BSB.toLazyByteString (BSB.intDec tid))
 #endif
   P.closeFd fd
