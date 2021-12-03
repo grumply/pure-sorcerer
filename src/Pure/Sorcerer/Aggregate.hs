@@ -11,6 +11,9 @@ import qualified Data.ByteString.Lazy.Char8 as BSLC
 
 import qualified System.Posix.Files as P
 import qualified System.Posix.IO as P
+#ifdef __GHC__
+import qualified System.Posix.IO.ByteString.Lazy as P (fdWrites)
+#endif
 import System.Posix.Types as P (Fd, FileOffset, ByteCount, COff)
 
 import Foreign.ForeignPtr (withForeignPtr)
@@ -40,10 +43,10 @@ writeAggregate fp tid mag = do
     tidl = succ (round (logBase 10 (fromIntegral tid)))
     commit = BSB.lazyByteString stid <> BSB.lazyByteString (BSLC.replicate (12 - tidl) ' ')
     bsb = commit <> "\n" <> BSB.lazyByteString (encode_ mag)
-    (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString bsb
 
-  withForeignPtr fptr $ \wptr -> do
-    P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
+#ifdef __GHC__
+  P.fdWrites fd (BSB.toLazyByteString bsb)
+#endif
 
   P.closeFd fd
 
@@ -64,9 +67,9 @@ commitTransaction :: FilePath -> TransactionId -> IO ()
 commitTransaction fp tid = do
   fd <- P.openFd fp P.WriteOnly (Just $ P.unionFileModes P.ownerReadMode P.ownerWriteMode) P.defaultFileFlags
   P.setFdOption fd P.SynchronousWrites True
-  let (fptr, off, len) = BS.toForeignPtr $ BSLC.toStrict $ BSB.toLazyByteString (BSB.intDec tid)
-  withForeignPtr fptr $ \wptr -> 
-    P.fdWriteBuf fd (plusPtr wptr off) (fromIntegral len)
+#ifdef __GHC__
+  P.fdWrites fd (BSB.toLazyByteString (BSB.intDec tid))
+#endif
   P.closeFd fd
 
  
