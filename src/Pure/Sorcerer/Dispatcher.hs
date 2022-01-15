@@ -209,38 +209,10 @@ getListeners s = do
                 in
                   (ds',(composed,new))
 
-dispatchWith :: forall ev. (Typeable ev, Ord (Stream ev)) => (StreamManager ev -> IO ()) -> Stream ev -> Event -> IO ()
-dispatchWith initialize s ev = go
-  where
-    go = do
-      (untargeted,targeted) <- getListeners s
-      case targeted of
-        Left tl@(StreamManager (s,mv)) -> do
-          -- Newly-created StreamManager requires initialization 
-          -- since the callback MVar is empty. 
-          initialize tl
-          
-          -- The safety/correctness seems questionable. What if this
-          -- thread yields and the manager of the targeted listener
-          -- shuts down before the takeMVar happens? I really want to
-          -- avoid a second call to `getListeners`, though!
-          --
-          -- For high throughput, whatever `f` does needs to be fast!
-          -- A `writeChan` or `arrive` should be reasonable.
-          withMVar mv ($ [ev]) 
-          untargeted [ev]
+dispatchWith :: forall ev. (Typeable ev, Ord (Stream ev)) => ([Event] -> StreamManager ev -> IO ()) -> Stream ev -> Event -> IO ()
+dispatchWith initialize s ev = dispatchManyWith initialize s [ev]
 
-        Right (StreamManager (s,mv)) -> do
-          -- presumably this will eventually succeed?
-          mf <- tryTakeMVar mv
-          case mf of
-            Nothing -> yield >> go
-            Just f  -> do
-              f [ev]
-              putMVar mv f
-              untargeted [ev]
-
-dispatchManyWith :: forall ev. (Typeable ev, Ord (Stream ev)) => (StreamManager ev -> IO ()) -> Stream ev -> [Event] -> IO ()
+dispatchManyWith :: forall ev. (Typeable ev, Ord (Stream ev)) => ([Event] -> StreamManager ev -> IO ()) -> Stream ev -> [Event] -> IO ()
 dispatchManyWith initialize s evs = go
   where
     go = do
@@ -249,16 +221,7 @@ dispatchManyWith initialize s evs = go
         Left tl@(StreamManager (s,mv)) -> do
           -- Newly-created StreamManager requires initialization 
           -- since the callback MVar is empty. 
-          initialize tl
-          
-          -- The safety/correctness seems questionable. What if this
-          -- thread yields and the manager of the targeted listener
-          -- shuts down before the takeMVar happens? I really want to
-          -- avoid a second call to `getListeners`, though!
-          --
-          -- For high throughput, whatever `f` does needs to be fast!
-          -- A `writeChan` or `arrive` should be reasonable.
-          withMVar mv ($ evs)
+          initialize evs tl
           untargeted evs
 
         Right (StreamManager (s,mv)) -> do

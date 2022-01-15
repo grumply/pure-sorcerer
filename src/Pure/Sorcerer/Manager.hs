@@ -39,7 +39,7 @@ getBuilders = do
   bs <- readIORef builders
   pure (unsafeCoerce (Map.lookup ty bs))
 
-startManagerWithBuilders :: forall (ev :: *). (Manageable ev, ToJSON ev, Streamable ev, Ord (Stream ev), FromJSON ev, Typeable ev) => StreamManager ev -> IO ()
+startManagerWithBuilders :: forall (ev :: *). (Manageable ev, ToJSON ev, Streamable ev, Ord (Stream ev), FromJSON ev, Typeable ev) => [Event] -> StreamManager ev -> IO ()
 startManagerWithBuilders =
   let
     getter stream tid = do
@@ -59,12 +59,13 @@ class Manageable ev where
   
 instance {-# OVERLAPPABLE #-} Manageable ev
 
-startManager :: forall ev. (Typeable ev, Manageable ev, Ord (Stream ev), ToJSON ev, FromJSON ev, Streamable ev) => (Stream ev -> TransactionId -> IO [Aggregator ev]) -> StreamManager ev -> IO ()
-startManager builder sm@(StreamManager (stream,callback)) =
+startManager :: forall ev. (Typeable ev, Manageable ev, Ord (Stream ev), ToJSON ev, FromJSON ev, Streamable ev) => (Stream ev -> TransactionId -> IO [Aggregator ev]) -> [Event] -> StreamManager ev -> IO ()
+startManager builder evs sm@(StreamManager (stream,callback)) =
   void do
     forkIO do
       let fp = S.stream stream
       q <- newQueue
+      arriveMany q evs
       putMVar callback (arriveMany q)
       createDirectoryIfMissing True (takeDirectory fp)
       (log,tid) <- resume @ev fp
