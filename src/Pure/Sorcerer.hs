@@ -1,6 +1,7 @@
 module Pure.Sorcerer 
   ( sorcerer
   , read
+  , unsafeRead
   , write
   , writeMany
   , transact
