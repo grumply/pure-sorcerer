@@ -60,13 +60,13 @@ arriveMany (Queue q_) as =
 collect :: Queue a -> IO [a]
 collect (Queue q_) = do
   join $ modifyMVar q_ $ \case
-    Right b -> do 
-      putMVar b []
-      b <- newEmptyMVar
-      return (Right b,takeMVar b)
+    Right b -> do
+      mxs <- tryTakeMVar b
+      case mxs of
+        Nothing -> return (Right b,takeMVar b)
+        Just xs -> return (Left [],return $ List.reverse xs)
     Left [] -> do 
       b <- newEmptyMVar
       return (Right b,takeMVar b)
     Left xs -> 
       return (Left [],return $ List.reverse xs)
-
