@@ -63,23 +63,51 @@ startManager :: forall ev. (Typeable ev, Manageable ev, Ord (Stream ev), ToJSON 
 startManager builder evs sm@(StreamManager (stream,callback)) =
   void do
     forkIO do
-      let fp = S.stream stream
       q <- newQueue
       arriveMany q evs
       putMVar callback (arriveMany q)
-      createDirectoryIfMissing True (takeDirectory fp)
-      (log,tid) <- resume @ev fp
-      aggregators <- builder stream tid
-      run q log aggregators tid
+      exists <- doesFileExist fp
+      if exists then do
+        (log,tid) <- resume @ev fp
+        ags <- builder stream tid
+        run q log 0 mempty ags tid
+      else 
+        nostream q
   where
-    run :: Queue Event -> Log -> [Aggregator ev] -> TransactionId -> IO ()
-    run events log = running 0 mempty
+    fp = S.stream stream
+  
+    satisfy acc@(!count,!evs,ags,!tid) ev = case ev of
+      Read f -> do
+        let 
+          test :: Aggregator ev -> Maybe (IO ())
+          test (Aggregator _ mag _ _ _) = 
+            case cast mag of
+              Nothing -> Nothing
+              Just x  -> Just (f x)
+        case catMaybes (fmap test ags) of
+          (g : _) -> g
+          _ -> f Nothing
+        pure acc
+
+      Write e -> do
+        let 
+          !count' = count + 1
+          !tid' = tid + 1
+          !evs' = evs <> BSB.lazyByteString (encode_ (tid',e)) <> "\n"
+        ags' <- for ags (flip (integrate @ev) (tid',ev))
+        pure (count',evs',ags',tid')
+
+      Transact e _ -> do
+        let 
+          !count' = count + 1
+          !tid' = tid + 1
+          !evs' = evs <> BSB.lazyByteString (encode_ (tid',e)) <> "\n"
+        ags' <- for ags (flip (integrate @ev) (tid',ev))
+        pure (count',evs',ags',tid')
+
+    run :: Queue Event -> Log -> Int -> BSB.Builder -> [Aggregator ev] -> TransactionId -> IO ()
+    run events log = running 
       where
-        Microseconds us _ = threshold @ev
-
-        tryTimeout :: IO x -> IO (Maybe x)
-        tryTimeout io = catch (timeout us io) (\(_ :: SomeException) -> pure Nothing)
-
         running :: Int -> BSB.Builder -> [Aggregator ev] -> TransactionId -> IO ()
         running !count !evs ags !tid = do
           tryTimeout (collect events) >>= \case
@@ -87,55 +115,62 @@ startManager builder evs sm@(StreamManager (stream,callback)) =
               when (count > 0) do
                 record log evs tid
               ags' <- traverse persist ags
-              did <- tryShutdown
+              did <- tryShutdownWith events (close log)
               unless did do
                 running 0 mempty ags' tid
                   
             Just ms -> do
-              (count',evs',ags',tid') <- foldM fold (count,evs,ags,tid) ms
+              (count',evs',ags',tid') <- foldM satisfy (count,evs,ags,tid) ms
               if count' >= (batch @ev) then do
                 record log evs' tid'
                 running 0 mempty ags' tid'
               else
                 running count' evs' ags' tid'
 
-        tryShutdown = do
-          cb <- takeMVar callback
-          empty <- isEmptyQueue events
-          if empty then do
-            close log
-            removeStreamManager sm
-            pure True
-          else do
-            putMVar callback cb
-            pure False
+    -- `run` can correctly satisfy all requests, but requires an existing stream file. If we know
+    -- there is no stream file, we know there are no aggregates and we can avoid creating the 
+    -- stream file or the aggregate files and satisfy all reads with Nothing.  If this loop finds 
+    -- a `Write` or `Transact`, it creates the stream file and initializes the aggregates and 
+    -- transitions to the normal `run` loop.
+    nostream :: Queue Event -> IO ()
+    nostream events = loop
+      where
+        loop =
+          tryTimeout (collect events) >>= \case
+            Nothing -> do
+              did <- tryShutdownWith events (pure ())
+              unless did loop
+            Just ms -> 
+              go ms
+          where
+            go = \case
+              [] -> loop
+              (Read f : evs) -> f Nothing >> go evs
+              evs -> do
+                createDirectoryIfMissing True (takeDirectory fp)
+                (log,tid) <- resume @ev fp
+                ags <- builder stream tid
+                (count',evs',ags',tid') <- foldM satisfy (0,mempty,ags,tid) evs
+                if count' >= (batch @ev) then do
+                  record log evs' tid'
+                  run events log 0 mempty ags' tid'
+                else
+                  run events log count' evs' ags' tid'
 
-        fold acc@(!count,!evs,ags,!tid) ev = case ev of
-         
-          Read f -> do
-            let 
-              test :: Aggregator ev -> Maybe (IO ())
-              test (Aggregator _ mag _ _ _) = 
-                case cast mag of
-                  Nothing -> Nothing
-                  Just x  -> Just (f x)
-            case catMaybes (fmap test ags) of
-              (g : _) -> g
-              _ -> f Nothing
-            pure acc
+    tryShutdownWith :: Queue Event -> IO () -> IO Bool
+    tryShutdownWith events f = do
+      cb <- takeMVar callback
+      empty <- isEmptyQueue events
+      if empty then do
+        f
+        removeStreamManager sm
+        pure True
+      else do
+        putMVar callback cb
+        pure False
 
-          Write e -> do
-            let 
-              !count' = count + 1
-              !tid' = tid + 1
-              !evs' = evs <> BSB.lazyByteString (encode_ (tid',e)) <> "\n"
-            ags' <- for ags (flip (integrate @ev) (tid',ev))
-            pure (count',evs',ags',tid')
- 
-          Transact e _ -> do
-            let 
-              !count' = count + 1
-              !tid' = tid + 1
-              !evs' = evs <> BSB.lazyByteString (encode_ (tid',e)) <> "\n"
-            ags' <- for ags (flip (integrate @ev) (tid',ev))
-            pure (count',evs',ags',tid')
+    tryTimeout :: forall x. IO x -> IO (Maybe x)
+    tryTimeout io =
+      let Microseconds us _ = threshold @ev
+      in catch (timeout us io) (\(_ :: SomeException) -> pure Nothing)
+
