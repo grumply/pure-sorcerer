@@ -51,9 +51,6 @@ startManagerWithBuilders =
     startManager getter 
 
 class Manageable ev where
-  threshold :: Time
-  threshold = Milliseconds 30 0
-
   batch :: Int
   batch = 1
   
@@ -63,8 +60,7 @@ startManager :: forall ev. (Typeable ev, Manageable ev, Ord (Stream ev), ToJSON 
 startManager builder evs sm@(StreamManager (stream,callback)) =
   void do
     forkIO do
-      q <- newQueue
-      arriveMany q evs
+      q <- newQueue evs
       putMVar callback (arriveMany q)
       exists <- doesFileExist fp
       if exists then do
@@ -110,22 +106,22 @@ startManager builder evs sm@(StreamManager (stream,callback)) =
       where
         running :: Int -> BSB.Builder -> [Aggregator ev] -> TransactionId -> IO ()
         running !count !evs ags !tid = do
-          tryTimeout (collect events) >>= \case
-            Nothing -> do
-              when (count > 0) do
-                record log evs tid
-              ags' <- traverse persist ags
-              did <- tryShutdownWith events (close log)
-              unless did do
-                running 0 mempty ags' tid
-                  
-            Just ms -> do
-              (count',evs',ags',tid') <- foldM satisfy (count,evs,ags,tid) ms
-              if count' >= (batch @ev) then do
-                record log evs' tid'
-                running 0 mempty ags' tid'
-              else
-                running count' evs' ags' tid'
+          available <- checkQueue events
+          if available then do
+            ms <- collect events
+            (count',evs',ags',tid') <- foldM satisfy (count,evs,ags,tid) ms
+            if count' >= (batch @ev) then do
+              record log evs' tid'
+              running 0 mempty ags' tid'
+            else
+              running count' evs' ags' tid'
+          else do
+            when (count > 0) do
+              record log evs tid
+            ags' <- traverse persist ags
+            did <- tryShutdownWith events (close log)
+            unless did do
+              running 0 mempty ags' tid
 
     -- `run` can correctly satisfy all requests, but requires an existing stream file. If we know
     -- there is no stream file, we know there are no aggregates and we can avoid creating the 
@@ -135,13 +131,13 @@ startManager builder evs sm@(StreamManager (stream,callback)) =
     nostream :: Queue Event -> IO ()
     nostream events = loop
       where
-        loop =
-          tryTimeout (collect events) >>= \case
-            Nothing -> do
-              did <- tryShutdownWith events (pure ())
-              unless did loop
-            Just ms -> 
-              go ms
+        loop = do
+          available <- checkQueue events
+          if available then
+            collect events >>= go
+          else do
+            did <- tryShutdownWith events (pure ())
+            unless did loop
           where
             go = \case
               [] -> loop
@@ -159,18 +155,24 @@ startManager builder evs sm@(StreamManager (stream,callback)) =
 
     tryShutdownWith :: Queue Event -> IO () -> IO Bool
     tryShutdownWith events f = do
-      cb <- takeMVar callback
-      empty <- isEmptyQueue events
+      mcb <- tryTakeMVar callback
+      case mcb of
+        Nothing -> do
+          pure False
+        Just cb -> do
+          empty <- isEmptyQueue events
+          if empty then do
+            f
+            removeStreamManager sm
+            pure True
+          else do
+            putMVar callback cb
+            pure False
+
+    checkQueue q = do
+      empty <- isEmptyQueue q
       if empty then do
-        f
-        removeStreamManager sm
+        yield
+        Prelude.not <$> isEmptyQueue q
+      else
         pure True
-      else do
-        putMVar callback cb
-        pure False
-
-    tryTimeout :: forall x. IO x -> IO (Maybe x)
-    tryTimeout io =
-      let Microseconds us _ = threshold @ev
-      in catch (timeout us io) (\(_ :: SomeException) -> pure Nothing)
-

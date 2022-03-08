@@ -18,7 +18,7 @@ import qualified Data.ByteString.Lazy.Char8 as BSLC
 import qualified System.Posix.Files              as P
 import qualified System.Posix.IO                 as P
 #ifndef __GHCJS__
-import qualified System.Posix.IO.ByteString.Lazy as P (fdWrites)
+import qualified System.Posix.IO.ByteString.Lazy as P (fdWritev)
 #endif
 import           System.Posix.Types              as P (Fd, FileOffset, ByteCount, COff)
 
@@ -124,19 +124,19 @@ record (Log fd) bsb tid = void do
   -- seek to beginning and tag event log as uncommited
   P.fdSeek fd AbsoluteSeek 0
 #ifndef __GHCJS__
-  P.fdWrites fd (BSB.toLazyByteString (BSB.intDec 0 <> BSB.intDec tid))
+  P.fdWritev fd (BSB.toLazyByteString (BSB.intDec 0 <> BSB.intDec tid))
 #endif
 
   -- seek to end and write events
   P.fdSeek fd SeekFromEnd 0
 #ifndef __GHCJS__
-  P.fdWrites fd (BSB.toLazyByteString bsb)
+  P.fdWritev fd (BSB.toLazyByteString bsb)
 #endif
 
   -- seek to beginning and tag event log as commited 
   P.fdSeek fd AbsoluteSeek 0
 #ifndef __GHCJS__
-  P.fdWrites fd (BSB.toLazyByteString (BSB.intDec 1))
+  P.fdWritev fd (BSB.toLazyByteString (BSB.intDec 1))
 #endif
 
 close :: Log -> IO ()

@@ -1,5 +1,6 @@
 module Pure.Sorcerer.Queue 
   ( newQueue
+  , newEmptyQueue
   , withEmptyQueue
   , isEmptyQueue
   , arrive
@@ -9,7 +10,7 @@ module Pure.Sorcerer.Queue
   ) where
 
 import Control.Concurrent
-import Control.Monad (join,void)
+import Control.Monad (join,void,unless)
 import qualified Data.List as List (reverse)
 
 --------------------------------------------------------------------------------
@@ -19,19 +20,23 @@ import qualified Data.List as List (reverse)
 data Queue a = Queue (MVar (Either [a] (MVar [a])))
 
 {-# INLINE newQueue #-}
-newQueue :: IO (Queue a)
-newQueue = Queue <$> newMVar (Left [])
+newQueue :: [a] -> IO (Queue a)
+newQueue xs = Queue <$> newMVar (Left (List.reverse xs))
+
+{-# INLINE newEmptyQueue #-}
+newEmptyQueue :: IO (Queue a)
+newEmptyQueue = newQueue []
 
 {-# INLINE withEmptyQueue #-}
 withEmptyQueue :: Queue a -> IO () -> IO Bool
 withEmptyQueue (Queue q_) io =
   withMVar q_ $ \case
-    Left [] -> io >> pure True
-    Right b -> do
+    Pushing [] -> io >> pure True
+    Pulling b -> do
       ma <- tryReadMVar b
       case ma of
         Nothing -> io >> pure True
-        Just a  -> pure False
+        Just _  -> pure False
     _ -> pure False
 
 {-# INLINE isEmptyQueue #-}
@@ -42,31 +47,48 @@ isEmptyQueue = flip withEmptyQueue (pure ())
 arrive :: Queue a -> a -> IO ()
 arrive (Queue q_) x =
   modifyMVar_ q_ $ \case
-    Left xs -> return (Left (x:xs))
-    Right b -> do 
-      putMVar b [x]
-      return (Left [])
+    Pushing xs -> return (Pushing (x:xs))
+    Pulling b -> do 
+      push b x
+      pure (Pulling b)
 
 {-# INLINE arriveMany #-}
 arriveMany :: Queue a -> [a] -> IO ()
-arriveMany (Queue q_) as =
+arriveMany (Queue q_) as = do
   modifyMVar_ q_ $ \case
-    Left xs -> return (Left (List.reverse as ++ xs))
-    Right b -> do
-      putMVar b as
-      return (Left [])
+    Pushing xs -> do
+      return (Pushing (List.reverse as ++ xs))
+    Pulling b -> do
+      pushMany b as
+      pure (Pulling b)
 
 {-# INLINE collect #-}
 collect :: Queue a -> IO [a]
 collect (Queue q_) = do
   join $ modifyMVar q_ $ \case
-    Right b -> do
-      mxs <- tryTakeMVar b
+
+    Pulling b -> do
+      mxs <- tryPull b
       case mxs of
-        Nothing -> return (Right b,takeMVar b)
-        Just xs -> return (Left [],return $ List.reverse xs)
-    Left [] -> do 
-      b <- newEmptyMVar
-      return (Right b,takeMVar b)
-    Left xs -> 
-      return (Left [],return $ List.reverse xs)
+        Nothing -> return (Pulling b,yield >> pull b)
+        Just xs -> return (Pushing [],return (List.reverse xs))
+
+    Pushing [] -> do 
+      b <- puller
+      return (Pulling b,yield >> pull b)
+
+    Pushing xs -> 
+      return (Pushing [],return (List.reverse xs))
+
+pattern Pulling a = Right a
+pattern Pushing a = Left a
+
+puller = newEmptyMVar
+tryPull = tryTakeMVar
+pull = takeMVar
+push b x = do
+  pushed <- tryPutMVar b [x]
+  unless pushed (modifyMVar_ b (pure . (x:)))
+pushMany b xs = do
+  pushed <- tryPutMVar b (List.reverse xs)
+  unless pushed (modifyMVar_ b (pure . (List.reverse xs ++)))

@@ -228,7 +228,8 @@ dispatchManyWith initialize s evs = go
           -- presumably this will eventually succeed?
           mf <- tryTakeMVar mv
           case mf of
-            Nothing -> yield >> go
+            Nothing -> do
+              yield >> go
             Just f  -> do
               f evs
               putMVar mv f
