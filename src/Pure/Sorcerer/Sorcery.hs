@@ -44,8 +44,8 @@ subscribeStream s f = do
   addStreamListener (Right mtid) s (traverse_ g)
   where
     g = \case
-      Write ev -> ?command (f (unsafeCoerce ev)) (pure ()) >>= \b -> unless b (unsubscribeStream s)
-      Transact ev _ -> ?command (f (unsafeCoerce ev)) (pure ()) >>= \b -> unless b (unsubscribeStream s)
+      Write ev -> send (f (unsafeCoerce ev)) (pure ()) >>= \b -> unless b (unsubscribeStream s)
+      Transact ev _ -> send (f (unsafeCoerce ev)) (pure ()) >>= \b -> unless b (unsubscribeStream s)
       _ -> pure ()
 
 subscribeStreams :: forall ev msg. (Typeable ev, Elm msg) => (ev -> msg) -> IO (Listener ev)
@@ -54,8 +54,8 @@ subscribeStreams f = do
   addListener (Right mtid) (traverse_ g)
   where
     g = \case
-      Write ev -> ?command (f (unsafeCoerce ev)) (pure ()) >>= \b -> unless b (unsubscribeStreams @ev)
-      Transact ev _ -> ?command (f (unsafeCoerce ev)) (pure ()) >>= \b -> unless b (unsubscribeStreams @ev)
+      Write ev -> send (f (unsafeCoerce ev)) (pure ()) >>= \b -> unless b (unsubscribeStreams @ev)
+      Transact ev _ -> send (f (unsafeCoerce ev)) (pure ()) >>= \b -> unless b (unsubscribeStreams @ev)
       _ -> pure ()
 
 unsubscribeStream :: (Typeable ev, Ord (Stream ev)) => Stream ev -> IO ()
